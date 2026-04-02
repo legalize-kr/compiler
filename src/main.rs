@@ -2,6 +2,7 @@ mod git_repo;
 mod render;
 mod xml_parser;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,7 +159,13 @@ fn plan_entries(
             .promulgation_date
             .cmp(&right.metadata.promulgation_date)
             .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
-            .then_with(|| left.mst.cmp(&right.mst))
+            .then_with(|| {
+                compare_optional_numeric(
+                    &left.metadata.promulgation_number,
+                    &right.metadata.promulgation_number,
+                )
+            })
+            .then_with(|| compare_numeric(&left.mst, &right.mst))
     });
 
     let mut registry = PathRegistry::default();
@@ -174,6 +181,26 @@ fn plan_entries(
     }
 
     Ok(entries)
+}
+
+fn compare_optional_numeric(left: &str, right: &str) -> Ordering {
+    match (parse_numeric_key(left), parse_numeric_key(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn compare_numeric(left: &str, right: &str) -> Ordering {
+    match (parse_numeric_key(left), parse_numeric_key(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn parse_numeric_key(value: &str) -> Option<u64> {
+    value.parse().ok()
 }
 
 fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
@@ -239,23 +266,49 @@ mod tests {
 </법령>
 "#;
 
+    const SAMPLE_XML_3: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>000003</법령ID>
+    <공포일자>20240101</공포일자>
+    <공포번호>00002</공포번호>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[테스트법]]></법령명_한글>
+    <시행일자>20240101</시행일자>
+    <연락부서><부서단위><소관부처명>법무부</소관부처명></부서단위></연락부서>
+  </기본정보>
+  <조문>
+    <조문단위>
+      <조문번호>2</조문번호>
+      <조문제목><![CDATA[개정]]></조문제목>
+      <조문내용><![CDATA[제2조 (개정) 테스트를 개정한다.]]></조문내용>
+    </조문단위>
+  </조문>
+</법령>
+"#;
+
     #[test]
     fn plan_entries_sorts_and_assigns_paths() {
         let temp = TempDir::new().unwrap();
         let detail_dir = temp.path().join("detail");
         fs::create_dir_all(&detail_dir).unwrap();
-        fs::write(detail_dir.join("2.xml"), SAMPLE_XML_2).unwrap();
+        fs::write(detail_dir.join("10.xml"), SAMPLE_XML_2).unwrap();
         fs::write(detail_dir.join("1.xml"), SAMPLE_XML_1).unwrap();
+        fs::write(detail_dir.join("2.xml"), SAMPLE_XML_3).unwrap();
 
         let mut history = HashMap::new();
         history.insert(String::from("1"), String::from("제정"));
         history.insert(String::from("2"), String::from("일부개정"));
+        history.insert(String::from("10"), String::from("일부개정"));
 
         let entries = plan_entries(&detail_dir, &history).unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].mst, "1");
         assert_eq!(entries[0].path, "테스트법/법률.md");
-        assert_eq!(entries[1].path, "테스트법/시행령.md");
+        assert_eq!(entries[1].mst, "2");
+        assert_eq!(entries[1].path, "테스트법/법률.md");
+        assert_eq!(entries[2].mst, "10");
+        assert_eq!(entries[2].path, "테스트법/시행령.md");
     }
 
     #[test]
