@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use sha1::{Digest, Sha1};
+use openssl::sha;
 
 const BOT_NAME: &str = "legalize-kr-bot";
 const BOT_EMAIL: &str = "bot@legalize.kr";
@@ -417,10 +417,10 @@ fn tree_sort_cmp(a: &(&[u8], [u8; 20], bool), b: &(&[u8], [u8; 20], bool)) -> st
 
 fn git_hash(typename: &[u8], data: &[u8]) -> [u8; 20] {
     let hdr = format!("{} {}\0", std::str::from_utf8(typename).unwrap(), data.len());
-    let mut h = Sha1::new();
+    let mut h = sha::Sha1::new();
     h.update(hdr.as_bytes());
     h.update(data);
-    h.finalize().into()
+    h.finish()
 }
 
 fn parse_hex(h: &str) -> Result<[u8; 20]> {
@@ -696,7 +696,7 @@ impl PackWriter {
             /* drop f before re-reading the file */
         }
         let data = fs::read(&self.path)?;
-        let cksum: [u8; 20] = { let mut h = Sha1::new(); h.update(&data); h.finalize().into() };
+        let cksum: [u8; 20] = sha::sha1(&data);
         fs::OpenOptions::new().append(true).open(&self.path)?.write_all(&cksum)?;
         Ok(())
     }
