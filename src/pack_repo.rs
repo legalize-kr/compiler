@@ -38,6 +38,10 @@ pub struct PackRepoWriter {
     groups: Vec<Group>,
     parent: Option<[u8; 20]>,
     output: PathBuf,
+    /* kr/ tree cache for REF_DELTA */
+    dir_tree_cache: Vec<u8>,           /* serialized kr/ tree bytes */
+    dir_tree_sha_offsets: Vec<usize>,  /* byte offset of each group SHA in dir_tree_cache */
+    dir_tree_prev_sha: Option<[u8; 20]>,
 }
 
 impl PackRepoWriter {
@@ -59,6 +63,9 @@ impl PackRepoWriter {
             groups: Vec::new(),
             parent: None,
             output: output.to_path_buf(),
+            dir_tree_cache: Vec::new(),
+            dir_tree_sha_offsets: Vec::new(),
+            dir_tree_prev_sha: None,
         })
     }
 
@@ -162,16 +169,52 @@ impl PackRepoWriter {
             g.cached_sha = Some(sha);
         }
 
-        /* 2. Build kr/ tree */
-        let mut kr_buf = Vec::with_capacity(self.groups.len() * 80);
-        for g in &self.groups {
-            kr_buf.extend_from_slice(b"40000 ");
-            kr_buf.extend_from_slice(&g.name);
-            kr_buf.push(0);
-            kr_buf.extend_from_slice(&g.cached_sha.unwrap());
+        /* 2. Build kr/ tree, using REF_DELTA when possible.
+         *    Delta is valid when no new groups were added (same structure). */
+        let dir_sha;
+        let can_delta = self.dir_tree_prev_sha.is_some()
+            && self.dir_tree_sha_offsets.len() == self.groups.len();
+
+        if can_delta {
+            /* Find which group changed by comparing against dir_tree_cache */
+            let mut changed_idx = None;
+            for (i, g) in self.groups.iter().enumerate() {
+                let off = self.dir_tree_sha_offsets[i];
+                let new = g.cached_sha.unwrap();
+                if self.dir_tree_cache[off..off + 20] != new {
+                    changed_idx = Some((i, off, new));
+                    break;
+                }
+            }
+
+            if let Some((_, off, new_sha)) = changed_idx {
+                /* Build delta BEFORE patching cache */
+                let delta = make_copy_insert_delta(
+                    self.dir_tree_cache.len(), off, &new_sha,
+                );
+                /* Now patch cache */
+                self.dir_tree_cache[off..off + 20].copy_from_slice(&new_sha);
+                dir_sha = git_hash(b"tree", &self.dir_tree_cache);
+                self.pw.write_ref_delta(self.dir_tree_prev_sha.unwrap(), &delta)?;
+            } else {
+                /* Nothing changed in kr/ tree (shouldn't happen, but safe) */
+                dir_sha = self.dir_tree_prev_sha.unwrap();
+            }
+        } else {
+            /* Full serialize + record offsets for future deltas */
+            self.dir_tree_cache.clear();
+            self.dir_tree_sha_offsets.clear();
+            for g in &self.groups {
+                self.dir_tree_cache.extend_from_slice(b"40000 ");
+                self.dir_tree_cache.extend_from_slice(&g.name);
+                self.dir_tree_cache.push(0);
+                self.dir_tree_sha_offsets.push(self.dir_tree_cache.len());
+                self.dir_tree_cache.extend_from_slice(&g.cached_sha.unwrap());
+            }
+            dir_sha = git_hash(b"tree", &self.dir_tree_cache);
+            self.pw.write_obj(2, &self.dir_tree_cache)?;
         }
-        let kr_sha = git_hash(b"tree", &kr_buf);
-        self.pw.write_obj(2, &kr_buf)?;
+        self.dir_tree_prev_sha = Some(dir_sha);
 
         /* 3. Root tree: root_files + kr directory, sorted by git rules */
         let mut root = Vec::<(&[u8], [u8; 20], bool)>::new();
@@ -179,7 +222,7 @@ impl PackRepoWriter {
             root.push((&e.name, e.sha, false));
         }
         if !self.groups.is_empty() {
-            root.push((b"kr", kr_sha, true));
+            root.push((b"kr", dir_sha, true));
         }
         root.sort_by(|a, b| sort_key(a.0, a.2).cmp(&sort_key(b.0, b.2)));
 
@@ -266,6 +309,55 @@ fn compress(data: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
+/*
+ * Generate a git pack delta: copy(0..off) + insert(20 bytes) + copy(off+20..end).
+ * Source and destination have the same length; only 20 bytes at `off` differ.
+ */
+fn make_copy_insert_delta(total: usize, off: usize, new_sha: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    encode_varint(&mut out, total);
+    encode_varint(&mut out, total);
+
+    /* Copy [0, off) from source */
+    if off > 0 {
+        emit_copy(&mut out, 0, off);
+    }
+
+    /* Insert 20 new SHA bytes */
+    out.push(20);
+    out.extend_from_slice(new_sha);
+
+    /* Copy [off+20, total) from source */
+    let tail_off = off + 20;
+    let tail_sz = total - tail_off;
+    if tail_sz > 0 {
+        emit_copy(&mut out, tail_off, tail_sz);
+    }
+    out
+}
+
+/* Emit a git pack delta copy instruction: copy `size` bytes from source at `offset`. */
+fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
+    let mut cmd: u8 = 0x80;
+    let mut args = Vec::with_capacity(7);
+    if offset & 0xff != 0       { cmd |= 0x01; args.push((offset & 0xff) as u8); }
+    if offset & 0xff00 != 0     { cmd |= 0x02; args.push(((offset >> 8) & 0xff) as u8); }
+    if offset & 0xff0000 != 0   { cmd |= 0x04; args.push(((offset >> 16) & 0xff) as u8); }
+    if offset & 0xff000000 != 0 { cmd |= 0x08; args.push(((offset >> 24) & 0xff) as u8); }
+    if size & 0xff != 0         { cmd |= 0x10; args.push((size & 0xff) as u8); }
+    if size & 0xff00 != 0       { cmd |= 0x20; args.push(((size >> 8) & 0xff) as u8); }
+    if size & 0xff0000 != 0     { cmd |= 0x40; args.push(((size >> 16) & 0xff) as u8); }
+    out.push(cmd);
+    out.extend_from_slice(&args);
+}
+
+fn encode_varint(out: &mut Vec<u8>, mut v: usize) {
+    while v >= 128 {
+        out.push((v & 0x7f) as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
 
 fn commit_time(date: &str) -> (i64, i32) {
     let d = if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && date >= "19700101" {
@@ -332,6 +424,24 @@ impl PackWriter {
         self.raw(&compress(data))?;
         self.n += 1;
         Ok(sha)
+    }
+
+    fn write_ref_delta(&mut self, base: [u8; 20], delta: &[u8]) -> Result<()> {
+        let sz = delta.len();
+        let mut hdr = (7u8 << 4) | (sz & 0xf) as u8;
+        let mut rem = sz >> 4;
+        if rem > 0 { hdr |= 0x80; }
+        self.raw(&[hdr])?;
+        while rem > 0 {
+            let mut b = (rem & 0x7f) as u8;
+            rem >>= 7;
+            if rem > 0 { b |= 0x80; }
+            self.raw(&[b])?;
+        }
+        self.raw(&base)?;
+        self.raw(&compress(delta))?;
+        self.n += 1;
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
