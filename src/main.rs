@@ -423,4 +423,50 @@ mod tests {
         revwalk.push_head().unwrap();
         assert_eq!(revwalk.count(), 2);
     }
+
+    #[test]
+    fn end_to_end_alternative_builds_bare_repo() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join(".cache");
+        let detail_dir = cache_dir.join("detail");
+        let history_dir = cache_dir.join("history");
+        fs::create_dir_all(&detail_dir).unwrap();
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::write(detail_dir.join("1.xml"), SAMPLE_XML_1).unwrap();
+        fs::write(detail_dir.join("2.xml"), SAMPLE_XML_2).unwrap();
+        fs::write(detail_dir.join("3.xml"), SAMPLE_XML_3).unwrap();
+        fs::write(
+            history_dir.join("테스트법.json"),
+            r#"[{"법령일련번호":"1","제개정구분명":"제정"},{"법령일련번호":"2","제개정구분명":"일부개정"}]"#,
+        )
+        .unwrap();
+        fs::write(
+            history_dir.join("테스트법 시행령.json"),
+            r#"[{"법령일련번호":"10","제개정구분명":"일부개정"}]"#,
+        )
+        .unwrap();
+
+        let output = temp.path().join("output.git");
+        run(Cli {
+            cache_dir,
+            output: output.clone(),
+            readme: None,
+            alternative: true,
+        })
+        .unwrap();
+
+        /* verify with git CLI */
+        let status = std::process::Command::new("git")
+            .args(["--git-dir", output.to_str().unwrap(), "rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        let count: usize = String::from_utf8_lossy(&status.stdout).trim().parse().unwrap();
+        assert_eq!(count, 3);
+
+        let status = std::process::Command::new("git")
+            .args(["--git-dir", output.to_str().unwrap(), "fsck", "--no-progress"])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "git fsck failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
 }

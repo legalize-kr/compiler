@@ -9,6 +9,7 @@
  * subtrees keep their SHA.
  */
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -38,10 +39,12 @@ pub struct PackRepoWriter {
     groups: Vec<Group>,
     parent: Option<[u8; 20]>,
     output: PathBuf,
-    /* kr/ tree cache for REF_DELTA */
-    dir_tree_cache: Vec<u8>,           /* serialized kr/ tree bytes */
-    dir_tree_sha_offsets: Vec<usize>,  /* byte offset of each group SHA in dir_tree_cache */
+    /* directory tree cache for REF_DELTA */
+    dir_tree_cache: Vec<u8>,
+    dir_tree_sha_offsets: Vec<usize>,
     dir_tree_prev_sha: Option<[u8; 20]>,
+    /* blob cache: path → (sha, content) for blob delta chains */
+    prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
 }
 
 impl PackRepoWriter {
@@ -66,6 +69,7 @@ impl PackRepoWriter {
             dir_tree_cache: Vec::new(),
             dir_tree_sha_offsets: Vec::new(),
             dir_tree_prev_sha: None,
+            prev_blobs: HashMap::new(),
         })
     }
 
@@ -100,7 +104,22 @@ impl PackRepoWriter {
         &mut self, path: &str, content: &[u8], msg: &str, epoch: i64, tz: i32,
         author_override: Option<String>, committer_override: Option<String>,
     ) -> Result<()> {
-        let blob_sha = self.pw.write_obj(3, content)?;
+        let blob_sha = git_hash(b"blob", content);
+
+        /* Try blob delta against previous version of same path */
+        if let Some((prev_sha, prev_content)) = self.prev_blobs.get(path) {
+            let delta = create_delta(prev_content, content);
+            if delta.len() < content.len() * 3 / 4 {
+                /* delta is worthwhile (saves >= 25%) */
+                self.pw.write_ref_delta(*prev_sha, &delta)?;
+            } else {
+                self.pw.write_obj(3, content)?;
+            }
+        } else {
+            self.pw.write_obj(3, content)?;
+        }
+        self.prev_blobs.insert(path.to_owned(), (blob_sha, content.to_vec()));
+
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
         match parts.len() {
@@ -169,7 +188,7 @@ impl PackRepoWriter {
             g.cached_sha = Some(sha);
         }
 
-        /* 2. Build kr/ tree, using REF_DELTA when possible.
+        /* 2. Build directory tree, using REF_DELTA when possible.
          *    Delta is valid when no new groups were added (same structure). */
         let dir_sha;
         let can_delta = self.dir_tree_prev_sha.is_some()
@@ -224,7 +243,7 @@ impl PackRepoWriter {
         if !self.groups.is_empty() {
             root.push((b"kr", dir_sha, true));
         }
-        root.sort_by(|a, b| sort_key(a.0, a.2).cmp(&sort_key(b.0, b.2)));
+        root.sort_by(tree_sort_cmp);
 
         let mut root_buf = Vec::new();
         for (name, sha, is_tree) in &root {
@@ -283,10 +302,21 @@ fn tree_bytes(entries: &[Entry]) -> Vec<u8> {
     buf
 }
 
-fn sort_key(name: &[u8], is_tree: bool) -> Vec<u8> {
-    let mut k = name.to_vec();
-    if is_tree { k.push(b'/'); }
-    k
+fn tree_sort_cmp(a: &(&[u8], [u8; 20], bool), b: &(&[u8], [u8; 20], bool)) -> std::cmp::Ordering {
+    /* git sorts tree entries by name, with '/' appended to directories */
+    let ak: &[u8] = a.0;
+    let bk: &[u8] = b.0;
+    let common = std::cmp::min(ak.len(), bk.len());
+    match ak[..common].cmp(&bk[..common]) {
+        std::cmp::Ordering::Equal => {
+            let a_tail = if a.2 { b'/' } else { 0 };
+            let b_tail = if b.2 { b'/' } else { 0 };
+            let a_next = ak.get(common).copied().unwrap_or(a_tail);
+            let b_next = bk.get(common).copied().unwrap_or(b_tail);
+            a_next.cmp(&b_next)
+        }
+        other => other,
+    }
 }
 
 fn git_hash(typename: &[u8], data: &[u8]) -> [u8; 20] {
@@ -298,15 +328,120 @@ fn git_hash(typename: &[u8], data: &[u8]) -> [u8; 20] {
 }
 
 fn hex(sha: &[u8; 20]) -> String {
-    sha.iter().map(|b| format!("{b:02x}")).collect()
+    let mut s = String::with_capacity(40);
+    for b in sha {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 fn compress(data: &[u8]) -> Vec<u8> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
-    let mut e = ZlibEncoder::new(Vec::new(), Compression::fast());
-    e.write_all(data).unwrap();
-    e.finish().unwrap()
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::new(6));
+    /* Vec write only fails on OOM, which aborts anyway */
+    e.write_all(data).expect("zlib write");
+    e.finish().expect("zlib finish")
+}
+
+/*
+ * Binary delta: find matching blocks between src and dst using a hash index.
+ * Returns git pack delta format: varint(src_size) + varint(dst_size) + instructions.
+ *
+ * Uses 16-byte block fingerprinting (same approach as git's diff-delta.c).
+ */
+const BLOCK_SIZE: usize = 16;
+const INDEX_STEP: usize = 16; /* step=1: 320MB->305MB but 3:37->11:28 (81k commits) */
+
+fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(dst.len() / 2);
+    encode_varint(&mut out, src.len());
+    encode_varint(&mut out, dst.len());
+
+    if src.len() < BLOCK_SIZE {
+        emit_inserts(&mut out, dst);
+        return out;
+    }
+
+    /* Build hash index of source at every INDEX_STEP bytes */
+    let mut index: HashMap<u32, Vec<usize>> = HashMap::new();
+    for i in (0..src.len().saturating_sub(BLOCK_SIZE - 1)).step_by(INDEX_STEP) {
+        let h = block_hash(&src[i..i + BLOCK_SIZE]);
+        index.entry(h).or_default().push(i);
+    }
+
+    let mut dpos: usize = 0;
+    let mut pending: Vec<u8> = Vec::new();
+
+    while dpos < dst.len() {
+        let remaining = dst.len() - dpos;
+        let mut best_soff: usize = 0;
+        let mut best_len: usize = 0;
+
+        if remaining >= BLOCK_SIZE {
+            let h = block_hash(&dst[dpos..dpos + BLOCK_SIZE]);
+            if let Some(positions) = index.get(&h) {
+                for &soff in positions {
+                    /* verify match and extend */
+                    let mlen = match_length(src, soff, dst, dpos);
+                    if mlen > best_len {
+                        best_len = mlen;
+                        best_soff = soff;
+                    }
+                }
+            }
+        }
+
+        if best_len >= BLOCK_SIZE {
+            /* flush pending inserts, then emit copy */
+            flush_inserts(&mut out, &mut pending);
+            emit_copy(&mut out, best_soff, best_len);
+            dpos += best_len;
+        } else {
+            pending.push(dst[dpos]);
+            dpos += 1;
+        }
+    }
+
+    flush_inserts(&mut out, &mut pending);
+    out
+}
+
+fn block_hash(data: &[u8]) -> u32 {
+    /* FNV-1a 32-bit */
+    let mut h: u32 = 0x811c9dc5;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h
+}
+
+fn match_length(src: &[u8], soff: usize, dst: &[u8], doff: usize) -> usize {
+    let max = std::cmp::min(src.len() - soff, dst.len() - doff);
+    let mut len = 0;
+    while len < max && src[soff + len] == dst[doff + len] {
+        len += 1;
+    }
+    len
+}
+
+fn emit_inserts(out: &mut Vec<u8>, data: &[u8]) {
+    let mut pos = 0;
+    while pos < data.len() {
+        let chunk = std::cmp::min(127, data.len() - pos);
+        out.push(chunk as u8);
+        out.extend_from_slice(&data[pos..pos + chunk]);
+        pos += chunk;
+    }
+}
+
+fn flush_inserts(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        emit_inserts(out, pending);
+        pending.clear();
+    }
 }
 
 /*
@@ -387,7 +522,6 @@ fn days_since_epoch(y: i32, m: u32, d: u32) -> i64 {
 
 struct PackWriter {
     f: BufWriter<File>,
-    sha: Sha1,
     n: u32,
     path: PathBuf,
 }
@@ -395,7 +529,7 @@ struct PackWriter {
 impl PackWriter {
     fn new(path: &Path) -> Result<Self> {
         let f = BufWriter::with_capacity(1 << 20, File::create(path)?);
-        let mut w = Self { f, sha: Sha1::new(), n: 0, path: path.to_path_buf() };
+        let mut w = Self { f, n: 0, path: path.to_path_buf() };
         w.raw(b"PACK")?;
         w.raw(&2u32.to_be_bytes())?;
         w.raw(&0u32.to_be_bytes())?;
@@ -404,7 +538,6 @@ impl PackWriter {
 
     fn raw(&mut self, d: &[u8]) -> Result<()> {
         self.f.write_all(d)?;
-        self.sha.update(d);
         Ok(())
     }
 
