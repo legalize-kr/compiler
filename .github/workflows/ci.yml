@@ -1,0 +1,26 @@
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: cargo-bins/cargo-binstall@main
+      # NOTE: Remove '--force' option once https://github.com/Swatinem/rust-cache/pull/308 is merged and released.
+      - run: cargo binstall --no-confirm --force cargo-shear
+
+      - run: cargo test
+      - run: cargo clippy --no-deps -- -D warnings
+      - run: cargo shear
+      - run: cargo fmt -- --check
