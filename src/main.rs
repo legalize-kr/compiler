@@ -131,12 +131,23 @@ fn run_default(
     Ok(())
 }
 
+struct Rendered {
+    path: String,
+    markdown: Vec<u8>,
+    message: String,
+    promulgation_date: String,
+}
+
+const CHUNK_SIZE: usize = 1000;
+
 fn run_alternative(
     output: &Path,
     readme: &Option<PathBuf>,
     detail_dir: &Path,
     entries: &[PlannedEntry],
 ) -> Result<()> {
+    use rayon::prelude::*;
+
     let mut repo = PackRepoWriter::create(output)?;
 
     if let Some(readme_path) = readme {
@@ -146,26 +157,36 @@ fn run_alternative(
         eprintln!("  committed README.md");
     }
 
-    for (index, entry) in entries.iter().enumerate() {
-        let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
-        let xml = fs::read(&xml_path)
-            .with_context(|| format!("failed to read {}", xml_path.display()))?;
-        let mut detail = parse_law_detail(&xml, &entry.mst)
-            .with_context(|| format!("failed to parse {}", xml_path.display()))?;
-        detail.metadata.amendment = entry.metadata.amendment.clone();
+    let total = entries.len();
+    let mut committed = 0;
 
-        let markdown = law_to_markdown(&detail)?;
-        let commit_message = build_commit_message(&detail.metadata, &entry.mst);
-        repo.commit_law(
-            &entry.path,
-            &markdown,
-            &commit_message,
-            &detail.metadata.promulgation_date,
-        )
-        .with_context(|| format!("failed to commit MST {}", entry.mst))?;
+    for chunk in entries.chunks(CHUNK_SIZE) {
+        /* Parse + render in parallel */
+        let rendered: Vec<Option<Rendered>> = chunk
+            .par_iter()
+            .map(|entry| {
+                let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
+                let xml = fs::read(&xml_path).ok()?;
+                let mut detail = parse_law_detail(&xml, &entry.mst).ok()?;
+                detail.metadata.amendment = entry.metadata.amendment.clone();
+                let markdown = law_to_markdown(&detail).ok()?;
+                let message = build_commit_message(&detail.metadata, &entry.mst);
+                Some(Rendered {
+                    path: entry.path.clone(),
+                    markdown,
+                    message,
+                    promulgation_date: detail.metadata.promulgation_date,
+                })
+            })
+            .collect();
 
-        if (index + 1) % 500 == 0 || index + 1 == entries.len() {
-            eprintln!("  committed {}/{}", index + 1, entries.len());
+        /* Commit sequentially in order */
+        for r in rendered.into_iter().flatten() {
+            repo.commit_law(&r.path, &r.markdown, &r.message, &r.promulgation_date)?;
+            committed += 1;
+            if committed % 500 == 0 || committed == total {
+                eprintln!("  committed {committed}/{total}");
+            }
         }
     }
 

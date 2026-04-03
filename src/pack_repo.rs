@@ -183,6 +183,53 @@ impl PackRepoWriter {
         Ok(())
     }
 
+    /// Resume from saved state. Opens existing repo, creates new packfile.
+    /// Previous blob content is NOT loaded — first update of each path is full blob.
+    pub fn resume(output: &Path, state_path: &Path) -> Result<Self> {
+        let data = fs::read_to_string(state_path).context("read state")?;
+        let state: serde_json::Value = serde_json::from_str(&data).context("parse state")?;
+
+        let parent = state.get("parent")
+            .and_then(|v| v.as_str())
+            .map(|h| parse_hex(h))
+            .transpose()?;
+
+        let mut groups = Vec::new();
+        if let Some(arr) = state.get("groups").and_then(|v| v.as_array()) {
+            for g in arr {
+                let name = g["name"].as_str().unwrap_or("").as_bytes().to_vec();
+                let sha = g["sha"].as_str().map(|h| parse_hex(h)).transpose()?;
+                let mut files = Vec::new();
+                if let Some(farr) = g["files"].as_array() {
+                    for f in farr {
+                        files.push(Entry {
+                            name: f["name"].as_str().unwrap_or("").as_bytes().to_vec(),
+                            sha: parse_hex(f["sha"].as_str().unwrap_or(""))?,
+                            is_tree: false,
+                        });
+                    }
+                }
+                groups.push(Group { name, files, cached_sha: sha });
+            }
+        }
+
+        let pp = output.join("objects/pack/tmp_pack_incr.pack");
+        fs::create_dir_all(pp.parent().unwrap())?;
+
+        Ok(Self {
+            pw: PackWriter::new(&pp)?,
+            root_files: Vec::new(),
+            groups,
+            parent,
+            output: output.to_path_buf(),
+            dir_tree_cache: Vec::new(),
+            dir_tree_sha_offsets: Vec::new(),
+            dir_tree_prev_sha: None,
+            prev_blobs: HashMap::new(),
+            blob_cache_order: Vec::new(),
+        })
+    }
+
     /// Save state for incremental updates.
     /// Saves parent SHA and path→blob_sha mapping (not content).
     /// Next run loads this to set parent; delta needs fresh content.
@@ -374,6 +421,18 @@ fn git_hash(typename: &[u8], data: &[u8]) -> [u8; 20] {
     h.update(hdr.as_bytes());
     h.update(data);
     h.finalize().into()
+}
+
+fn parse_hex(h: &str) -> Result<[u8; 20]> {
+    let mut out = [0u8; 20];
+    if h.len() != 40 {
+        anyhow::bail!("invalid hex SHA: {h}");
+    }
+    for i in 0..20 {
+        out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("invalid hex at {i}"))?;
+    }
+    Ok(out)
 }
 
 fn hex(sha: &[u8; 20]) -> String {

@@ -17,6 +17,7 @@ tempfile = "3.18"
 time = "0.3"
 sha1 = "0.10"
 flate2 = "1.0"
+rayon = "1.10"
 
 [profile.profiling]
 inherits = "release"
