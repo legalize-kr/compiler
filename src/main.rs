@@ -142,12 +142,7 @@ fn run_alternative(
     if let Some(readme_path) = readme {
         let readme = fs::read(readme_path)
             .with_context(|| format!("failed to read {}", readme_path.display()))?;
-        let msg = "initial commit\n\nCo-authored-by: Jihyeon Kim <simnalamburt@gmail.com>";
-        repo.commit_static_authored(
-            "README.md", &readme, msg, 1_774_839_600, 540,
-            "Junghwan Park <reserve.dev@gmail.com>",
-            "Jihyeon Kim <simnalamburt@gmail.com>",
-        )?;
+        repo.commit_static("README.md", &readme, "initial commit", 1_774_839_600, 540)?;
         eprintln!("  committed README.md");
     }
 

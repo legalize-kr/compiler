@@ -20,6 +20,9 @@ use sha1::{Digest, Sha1};
 
 const BOT_NAME: &str = "legalize-kr-bot";
 const BOT_EMAIL: &str = "bot@legalize.kr";
+const INITIAL_COMMIT_AUTHOR: &str = "Junghwan Park <reserve.dev@gmail.com>";
+const INITIAL_COMMIT_COMMITTER: &str = "Jihyeon Kim <simnalamburt@gmail.com>";
+const INITIAL_COMMIT_CO_AUTHORS: &[(&str, &str)] = &[("Jihyeon Kim", "simnalamburt@gmail.com")];
 
 struct Entry {
     name: Vec<u8>,
@@ -83,15 +86,13 @@ impl PackRepoWriter {
     pub fn commit_static(
         &mut self, path: &str, data: &[u8], msg: &str, epoch: i64, tz: i32,
     ) -> Result<()> {
-        self.commit_with_author(path, data, msg, epoch, tz, None, None)
-    }
-
-    pub fn commit_static_authored(
-        &mut self, path: &str, data: &[u8], msg: &str, epoch: i64, tz: i32,
-        author: &str, committer: &str,
-    ) -> Result<()> {
-        self.commit_with_author(path, data, msg, epoch, tz,
-                                Some(author.to_owned()), Some(committer.to_owned()))
+        let mut full_msg = String::from(msg);
+        for (name, email) in INITIAL_COMMIT_CO_AUTHORS {
+            full_msg.push_str(&format!("\n\nCo-authored-by: {name} <{email}>"));
+        }
+        self.commit_with_author(path, data, &full_msg, epoch, tz,
+                                Some(INITIAL_COMMIT_AUTHOR.to_owned()),
+                                Some(INITIAL_COMMIT_COMMITTER.to_owned()))
     }
 
     pub fn commit(
