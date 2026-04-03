@@ -15,6 +15,8 @@ use crate::git_repo::BareRepoWriter;
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawMetadata, parse_law_detail, parse_metadata_only};
 
+const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
+
 #[derive(Debug, Parser)]
 #[command(name = "legalize-kr-compiler")]
 #[command(about = "Compile cached law.go.kr XML/JSON into a fresh bare Git repository")]
@@ -25,10 +27,6 @@ struct Cli {
     /// Output bare repository path
     #[arg(short = 'o', long = "output", default_value = "output.git")]
     output: PathBuf,
-
-    /// Path to README.md to include in the repository
-    #[arg(long = "readme")]
-    readme: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,13 +72,15 @@ fn run(cli: Cli) -> Result<()> {
     );
     let mut repo = BareRepoWriter::create(&cli.output)?;
 
-    if let Some(readme_path) = &cli.readme {
-        let readme = fs::read(readme_path)
-            .with_context(|| format!("failed to read {}", readme_path.display()))?;
-        // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
-        repo.commit_static("README.md", &readme, "initial commit", 1_774_839_600, 540)?;
-        eprintln!("  committed README.md");
-    }
+    // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
+    repo.commit_static(
+        "README.md",
+        REPOSITORY_README,
+        "initial commit",
+        1_774_839_600,
+        540,
+    )?;
+    eprintln!("  committed README.md");
 
     for (index, entry) in entries.iter().enumerate() {
         let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
@@ -343,7 +343,6 @@ mod tests {
         run(Cli {
             cache_dir,
             output: output.clone(),
-            readme: None,
         })
         .unwrap();
 
@@ -352,6 +351,6 @@ mod tests {
         assert_eq!(head.shorthand(), Some("main"));
         let mut revwalk = repo.revwalk().unwrap();
         revwalk.push_head().unwrap();
-        assert_eq!(revwalk.count(), 2);
+        assert_eq!(revwalk.count(), 3);
     }
 }
