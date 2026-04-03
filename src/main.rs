@@ -155,7 +155,11 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     })
 }
 
-const CHUNK_SIZE: usize = 1000;
+/*
+ * chunk=100: 80.6s 1.2GB, chunk=250: 80.9s 1.3GB, chunk=500: 80.5s 1.4GB,
+ * chunk=1000: 81.6s 1.6GB, chunk=2000: 82.6s 2.0GB, chunk=5000: 82.3s 3.2GB
+ */
+const CHUNK_SIZE: usize = 500;
 
 fn run_alternative(
     output: &Path,
