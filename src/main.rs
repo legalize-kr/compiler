@@ -138,6 +138,23 @@ struct Rendered {
     promulgation_date: String,
 }
 
+fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
+    let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
+    let xml = fs::read(&xml_path)
+        .with_context(|| format!("failed to read {}", xml_path.display()))?;
+    let mut detail = parse_law_detail(&xml, &entry.mst)
+        .with_context(|| format!("failed to parse MST {}", entry.mst))?;
+    detail.metadata.amendment = entry.metadata.amendment.clone();
+    let markdown = law_to_markdown(&detail)?;
+    let message = build_commit_message(&detail.metadata, &entry.mst);
+    Ok(Rendered {
+        path: entry.path.clone(),
+        markdown,
+        message,
+        promulgation_date: detail.metadata.promulgation_date,
+    })
+}
+
 const CHUNK_SIZE: usize = 1000;
 
 fn run_alternative(
@@ -159,32 +176,31 @@ fn run_alternative(
 
     let total = entries.len();
     let mut committed = 0;
-
     let mut skipped = 0usize;
 
-    for chunk in entries.chunks(CHUNK_SIZE) {
-        /* Parse + render in parallel */
-        let rendered: Vec<Result<Rendered>> = chunk
-            .par_iter()
-            .map(|entry| {
-                let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
-                let xml = fs::read(&xml_path)
-                    .with_context(|| format!("failed to read {}", xml_path.display()))?;
-                let mut detail = parse_law_detail(&xml, &entry.mst)
-                    .with_context(|| format!("failed to parse MST {}", entry.mst))?;
-                detail.metadata.amendment = entry.metadata.amendment.clone();
-                let markdown = law_to_markdown(&detail)?;
-                let message = build_commit_message(&detail.metadata, &entry.mst);
-                Ok(Rendered {
-                    path: entry.path.clone(),
-                    markdown,
-                    message,
-                    promulgation_date: detail.metadata.promulgation_date,
-                })
-            })
-            .collect();
+    let chunks: Vec<&[PlannedEntry]> = entries.chunks(CHUNK_SIZE).collect();
+    let mut pending: Option<Vec<Result<Rendered>>> = None;
 
-        /* Commit sequentially in order */
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let detail_dir = detail_dir.to_path_buf();
+        /* Start parsing next chunk in background while committing current */
+        let next = if ci + 1 < chunks.len() {
+            let next_chunk: Vec<PlannedEntry> = chunks[ci + 1].to_vec();
+            let dd = detail_dir.clone();
+            Some(std::thread::spawn(move || -> Vec<Result<Rendered>> {
+                next_chunk.par_iter().map(|entry| render_entry(&dd, entry)).collect()
+            }))
+        } else {
+            None
+        };
+
+        /* Commit current chunk (first iteration parses synchronously) */
+        let rendered = if let Some(prev) = pending.take() {
+            prev
+        } else {
+            chunk.par_iter().map(|entry| render_entry(&detail_dir, entry)).collect()
+        };
+
         for r in rendered {
             match r {
                 Ok(r) => {
@@ -199,6 +215,11 @@ fn run_alternative(
                     eprintln!("  WARN: {e:#}");
                 }
             }
+        }
+
+        /* Collect next chunk's results */
+        if let Some(handle) = next {
+            pending = Some(handle.join().unwrap());
         }
     }
 
