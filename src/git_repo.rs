@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Output};
 
@@ -58,7 +58,8 @@ enum DirtyRootEntry {
 }
 
 struct PackWriter {
-    file: BufWriter<File>,
+    body_file: BufWriter<File>,
+    body_path: PathBuf,
     object_count: u32,
     path: PathBuf,
     seen: HashSet<[u8; 20]>,
@@ -517,17 +518,15 @@ impl BareRepoWriter {
 
 impl PackWriter {
     fn new(path: &Path) -> Result<Self> {
-        let file = BufWriter::with_capacity(1 << 20, File::create(path)?);
-        let mut writer = Self {
-            file,
+        let body_path = path.with_extension("pack.body");
+        let body_file = BufWriter::with_capacity(1 << 20, File::create(&body_path)?);
+        Ok(Self {
+            body_file,
+            body_path,
             object_count: 0,
             path: path.to_path_buf(),
             seen: HashSet::new(),
-        };
-        writer.write_raw(b"PACK")?;
-        writer.write_raw(&2u32.to_be_bytes())?;
-        writer.write_raw(&0u32.to_be_bytes())?;
-        Ok(writer)
+        })
     }
 
     fn write_object(&mut self, object_type: u8, data: &[u8]) -> Result<[u8; 20]> {
@@ -586,25 +585,49 @@ impl PackWriter {
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.file.flush()?;
+        self.body_file.flush()?;
 
-        {
-            let mut file = File::options().write(true).open(&self.path)?;
-            file.seek(SeekFrom::Start(8))?;
-            file.write_all(&self.object_count.to_be_bytes())?;
-            file.flush()?;
+        let mut output = BufWriter::with_capacity(1 << 20, File::create(&self.path)?);
+        let mut hasher = sha::Sha1::new();
+
+        let pack_header = [
+            b'P',
+            b'A',
+            b'C',
+            b'K',
+            0,
+            0,
+            0,
+            2,
+            (self.object_count >> 24) as u8,
+            (self.object_count >> 16) as u8,
+            (self.object_count >> 8) as u8,
+            self.object_count as u8,
+        ];
+        output.write_all(&pack_header)?;
+        hasher.update(&pack_header);
+
+        let mut body = BufReader::with_capacity(1 << 20, File::open(&self.body_path)?);
+        let mut buffer = [0_u8; 1 << 20];
+        loop {
+            let read = body.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buffer[..read];
+            output.write_all(chunk)?;
+            hasher.update(chunk);
         }
 
-        let digest = sha::sha1(&fs::read(&self.path)?);
-        File::options()
-            .append(true)
-            .open(&self.path)?
-            .write_all(&digest)?;
+        output.write_all(&hasher.finish())?;
+        output.flush()?;
+        fs::remove_file(&self.body_path)
+            .with_context(|| format!("failed to remove {}", self.body_path.display()))?;
         Ok(())
     }
 
     fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file.write_all(bytes)?;
+        self.body_file.write_all(bytes)?;
         Ok(())
     }
 }
