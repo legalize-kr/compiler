@@ -51,6 +51,12 @@ struct Group {
     cached_sha: Option<[u8; 20]>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DirtyRootEntry {
+    File(usize),
+    Kr,
+}
+
 struct PackWriter {
     file: BufWriter<File>,
     object_count: u32,
@@ -63,6 +69,10 @@ pub struct BareRepoWriter {
     temp_output: PathBuf,
     final_output: PathBuf,
     root_files: Vec<Entry>,
+    root_tree_cache: Vec<u8>,
+    root_tree_sha_offsets: Vec<usize>,
+    root_tree_kr_sha_offset: Option<usize>,
+    dirty_root_entry: Option<DirtyRootEntry>,
     prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
     groups: Vec<Group>,
     group_indices: HashMap<Vec<u8>, usize>,
@@ -104,6 +114,10 @@ impl BareRepoWriter {
             temp_output,
             final_output,
             root_files: Vec::new(),
+            root_tree_cache: Vec::new(),
+            root_tree_sha_offsets: Vec::new(),
+            root_tree_kr_sha_offset: None,
+            dirty_root_entry: None,
             prev_blobs: HashMap::new(),
             groups: Vec::new(),
             group_indices: HashMap::new(),
@@ -265,7 +279,15 @@ impl BareRepoWriter {
             .as_slice()
         {
             [name] => {
-                upsert(&mut self.root_files, name.as_bytes(), blob_sha, false);
+                let (index, inserted) =
+                    upsert(&mut self.root_files, name.as_bytes(), blob_sha, false);
+                if inserted {
+                    self.root_tree_sha_offsets.clear();
+                    self.root_tree_kr_sha_offset = None;
+                    self.dirty_root_entry = None;
+                } else {
+                    self.dirty_root_entry = Some(DirtyRootEntry::File(index));
+                }
                 self.dirty_group_index = None;
             }
             ["kr", group, filename] => {
@@ -278,6 +300,7 @@ impl BareRepoWriter {
                 );
                 self.groups[group_index].cached_sha = None;
                 self.dirty_group_index = Some(group_index);
+                self.dirty_root_entry = Some(DirtyRootEntry::Kr);
             }
             _ => bail!("unsupported repository path: {path}"),
         }
@@ -388,25 +411,77 @@ impl BareRepoWriter {
             }
         };
 
-        let mut root_entries =
-            Vec::with_capacity(self.root_files.len() + usize::from(kr_tree.is_some()));
-        for file in &self.root_files {
-            root_entries.push((&file.name[..], file.sha, false));
-        }
-        if let Some(kr_tree) = kr_tree {
-            root_entries.push((b"kr".as_slice(), kr_tree, true));
-        }
-        root_entries.sort_by(tree_sort_cmp);
+        let root_structure_dirty = self.root_tree_sha_offsets.len() != self.root_files.len()
+            || self.root_tree_kr_sha_offset.is_some() != kr_tree.is_some();
+        let root_sha = if root_structure_dirty {
+            self.root_tree_cache.clear();
+            self.root_tree_sha_offsets.resize(self.root_files.len(), 0);
+            self.root_tree_kr_sha_offset = None;
 
-        let mut root_tree = Vec::new();
-        for (name, sha, is_tree) in root_entries {
-            root_tree.extend_from_slice(if is_tree { b"40000 " } else { b"100644 " });
-            root_tree.extend_from_slice(name);
-            root_tree.push(0);
-            root_tree.extend_from_slice(&sha);
-        }
+            let mut root_entries =
+                Vec::with_capacity(self.root_files.len() + usize::from(kr_tree.is_some()));
+            for (index, file) in self.root_files.iter().enumerate() {
+                root_entries.push((Some(index), &file.name[..], file.sha, false));
+            }
+            if let Some(kr_tree) = kr_tree {
+                root_entries.push((None, b"kr".as_slice(), kr_tree, true));
+            }
+            root_entries.sort_by(|left, right| {
+                tree_sort_cmp(&(left.1, left.2, left.3), &(right.1, right.2, right.3))
+            });
 
-        let root_sha = self.writer.write_object(PACK_OBJECT_TREE, &root_tree)?;
+            for (kind, name, sha, is_tree) in root_entries {
+                self.root_tree_cache.extend_from_slice(if is_tree {
+                    b"40000 "
+                } else {
+                    b"100644 "
+                });
+                self.root_tree_cache.extend_from_slice(name);
+                self.root_tree_cache.push(0);
+                let sha_offset = self.root_tree_cache.len();
+                if let Some(index) = kind {
+                    self.root_tree_sha_offsets[index] = sha_offset;
+                } else {
+                    self.root_tree_kr_sha_offset = Some(sha_offset);
+                }
+                self.root_tree_cache.extend_from_slice(&sha);
+            }
+
+            self.dirty_root_entry = None;
+            self.writer
+                .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?
+        } else if let Some(dirty) = self.dirty_root_entry.take() {
+            let (sha_offset, new_sha) = match dirty {
+                DirtyRootEntry::File(index) => {
+                    let offset = self.root_tree_sha_offsets[index];
+                    (offset, self.root_files[index].sha)
+                }
+                DirtyRootEntry::Kr => {
+                    let offset = self
+                        .root_tree_kr_sha_offset
+                        .context("missing cached root kr offset")?;
+                    let sha = kr_tree.context("missing cached kr tree SHA")?;
+                    (offset, sha)
+                }
+            };
+            let delta = make_copy_insert_delta(self.root_tree_cache.len(), sha_offset, &new_sha);
+            self.root_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
+            let root_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.root_tree_cache);
+            if let Some(base_root_sha) = self.current_root_sha {
+                self.writer
+                    .write_ref_delta(base_root_sha, &delta, root_sha)?;
+            } else {
+                self.writer
+                    .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?;
+            }
+            root_sha
+        } else if let Some(root_sha) = self.current_root_sha {
+            root_sha
+        } else {
+            self.writer
+                .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?
+        };
+
         self.current_root_sha = Some(root_sha);
         self.tree_dirty = false;
         Ok(root_sha)
@@ -650,9 +725,12 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) {
+fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) -> (usize, bool) {
     match entries.iter().position(|entry| entry.name == name) {
-        Some(index) => entries[index].sha = sha,
+        Some(index) => {
+            entries[index].sha = sha;
+            (index, false)
+        }
         None => {
             let index = entries.partition_point(|entry| entry.name.as_slice() < name);
             entries.insert(
@@ -663,6 +741,7 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) {
                     is_tree,
                 },
             );
+            (index, true)
         }
     }
 }
@@ -977,6 +1056,38 @@ mod tests {
             git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
             "1"
         );
+    }
+
+    #[test]
+    fn root_tree_delta_handles_root_file_updates() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("output.git");
+        let mut writer = BareRepoWriter::create(&output).unwrap();
+        writer
+            .commit_static(
+                "README.md",
+                b"first\n",
+                "initial commit",
+                1_774_839_600,
+                540,
+            )
+            .unwrap();
+        writer
+            .commit_static(
+                "README.md",
+                b"second\n",
+                "update readme",
+                1_774_839_601,
+                540,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "2"
+        );
+        assert_eq!(git_stdout(&output, ["show", "HEAD:README.md"]), "second\n");
     }
 
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
