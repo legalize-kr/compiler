@@ -314,7 +314,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     let time = GitTimestampKst::from_promulgation_date(&detail.metadata.promulgation_date)?;
 
     let markdown = law_to_markdown(&detail)?;
-    let message = build_commit_message(&detail.metadata, &entry.mst);
+    let message = build_commit_message(&detail.metadata, &entry.mst)?;
     Ok(Rendered {
         path: entry.path.clone(),
         markdown,

@@ -57,32 +57,28 @@ impl GitTimestampKst {
     /// Converts a promulgation date into the deterministic noon-KST commit timestamp.
     pub fn from_promulgation_date(promulgation_date: &str) -> Result<Self> {
         //
-        // Normalize both `YYYYMMDD` and `YYYY-MM-DD` forms into the canonical date string the
-        // historical pipeline implicitly used when deriving commit timestamps.
+        // Promulgation dates are expected to come from the XML cache as bare `YYYYMMDD`.
+        // Reject anything else instead of quietly accepting alternate spellings.
         //
-        let effective_date = if promulgation_date.len() == 8
-            && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
+        if promulgation_date.len() != 8
+            || !promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
         {
+            bail!("expected promulgation date in YYYYMMDD form: {promulgation_date}");
+        }
+
+        //
+        // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
+        // same commit ids when upstream metadata predates Unix time.
+        //
+        let effective_date = if promulgation_date < "19700101" {
+            String::from("1970-01-01")
+        } else {
             format!(
                 "{}-{}-{}",
                 &promulgation_date[..4],
                 &promulgation_date[4..6],
                 &promulgation_date[6..8]
             )
-        } else {
-            promulgation_date.to_owned()
-        };
-
-        //
-        // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
-        // same commit ids even when upstream metadata is incomplete or predates Unix time.
-        //
-        let effective_date = if effective_date.len() != 10 {
-            String::from("2000-01-01")
-        } else if effective_date.as_str() < "1970-01-01" {
-            String::from("1970-01-01")
-        } else {
-            effective_date
         };
 
         //
@@ -1192,6 +1188,12 @@ mod tests {
         let date = git_stdout(&output, ["show", "-s", "--format=%ai", "HEAD"]);
         assert_eq!(epoch.trim(), "10800");
         assert_eq!(date.trim(), "1970-01-01 12:00:00 +0900");
+    }
+
+    #[test]
+    fn rejects_non_compact_promulgation_dates() {
+        let error = GitTimestampKst::from_promulgation_date("2024-01-01").unwrap_err();
+        assert!(error.to_string().contains("YYYYMMDD"));
     }
 
     #[test]

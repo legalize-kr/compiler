@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use regex::Regex;
 use serde::Serialize;
 
@@ -80,8 +80,17 @@ pub fn format_date(date: &str) -> String {
     }
 }
 
+/// Formats a required `YYYYMMDD` date as `YYYY-MM-DD`.
+fn format_required_yyyymmdd(date: &str) -> Result<String> {
+    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("expected YYYYMMDD date: {date}");
+    }
+
+    Ok(format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]))
+}
+
 /// Builds the Git commit message for one law revision.
-pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
+pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String> {
     //
     // Normalize display text and fill the same fallback labels the legacy pipeline used.
     //
@@ -92,9 +101,9 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
     } else {
         metadata.department_name.clone()
     };
-    let prom_date = format_date(&metadata.promulgation_date);
+    let prom_date = format_required_yyyymmdd(&metadata.promulgation_date)?;
     let prom_num = metadata.promulgation_number.clone();
-    let prom_raw = metadata.promulgation_date.replace('-', "");
+    let prom_raw = metadata.promulgation_date.clone();
     let field = if metadata.field.is_empty() {
         "미분류".to_owned()
     } else {
@@ -129,7 +138,7 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
     lines.push(format!("소관부처: {departments}"));
     lines.push(format!("법령분야: {field}"));
     lines.push(format!("법령MST: {mst}"));
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 /// Renders one parsed law document into the repository Markdown format.
@@ -158,7 +167,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .collect(),
-            promulgation_date: format_date(&detail.metadata.promulgation_date),
+            promulgation_date: format_required_yyyymmdd(&detail.metadata.promulgation_date)?,
             promulgation_number: detail.metadata.promulgation_number.clone(),
             enforcement_date: format_date(&detail.metadata.enforcement_date),
             field: detail.metadata.field.clone(),
@@ -472,5 +481,20 @@ mod tests {
         assert!(markdown.contains("  1\\. 첫 호"));
         assert!(markdown.contains("    가\\. 첫 목"));
         assert!(markdown.contains("## 부칙"));
+    }
+
+    #[test]
+    fn markdown_rejects_non_compact_promulgation_dates() {
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                law_name: String::from("테스트법"),
+                promulgation_date: String::from("2024-01-01"),
+                ..LawMetadata::default()
+            },
+            ..LawDetail::default()
+        };
+
+        let error = law_to_markdown(&detail).unwrap_err();
+        assert!(error.to_string().contains("YYYYMMDD"));
     }
 }
