@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,45 @@ impl GitTimestampKst {
     }
 }
 
+/// Owned repository path in either the root or `kr/<group>/` namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RepoPathBuf {
+    /// Root-level repository file such as `README.md`.
+    RootFile(String),
+    /// Law Markdown file under `kr/<group>/<filename>.md`.
+    KrFile {
+        /// Parent law directory name below `kr/`.
+        group: String,
+        /// Leaf Markdown filename inside the group directory.
+        filename: String,
+    },
+}
+
+impl RepoPathBuf {
+    /// Creates a root-level repository path.
+    pub fn root_file(name: impl Into<String>) -> Self {
+        Self::RootFile(name.into())
+    }
+
+    /// Creates a law Markdown path under `kr/<group>/`.
+    pub fn kr_file(group: impl Into<String>, filename: impl Into<String>) -> Self {
+        Self::KrFile {
+            group: group.into(),
+            filename: filename.into(),
+        }
+    }
+}
+
+impl fmt::Display for RepoPathBuf {
+    /// Renders the repository path in Git's slash-separated form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootFile(name) => f.write_str(name),
+            Self::KrFile { group, filename } => write!(f, "kr/{group}/{filename}"),
+        }
+    }
+}
+
 /// One tree entry inside either the root tree or a law group subtree.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -139,20 +179,6 @@ enum DirtyRootEntry {
     File(usize),
     /// The `kr/` subtree entry changed.
     Kr,
-}
-
-/// Parsed repository path split into the supported root and `kr/` layouts.
-#[derive(Debug)]
-enum RepoPath<'a> {
-    /// Root-level repository file such as `README.md`.
-    RootFile(&'a str),
-    /// Law Markdown file under `kr/<group>/<filename>.md`.
-    KrFile {
-        /// Parent law directory name below `kr/`.
-        group: &'a str,
-        /// Leaf Markdown filename inside the group directory.
-        filename: &'a str,
-    },
 }
 
 /// Cached root-tree bytes plus patch metadata for repeated commits.
@@ -222,7 +248,7 @@ pub struct BareRepoWriter {
 
     // Blob and subtree history that lets repeated law revisions reuse previous objects.
     /// Previous blob bodies keyed by repository path.
-    prev_blobs: HashMap<String, PreviousBlob>,
+    prev_blobs: HashMap<RepoPathBuf, PreviousBlob>,
     /// `kr/` subtree cache and patch metadata.
     kr: KrTreeState,
     /// Parent commit id for the next handcrafted commit object.
@@ -277,7 +303,7 @@ impl BareRepoWriter {
     /// Commits one rendered law Markdown file using bot authorship and law dates.
     pub fn commit_law(
         &mut self,
-        path: &str,
+        path: &RepoPathBuf,
         markdown: &[u8],
         message: &str,
         time: GitTimestampKst,
@@ -292,7 +318,7 @@ impl BareRepoWriter {
     /// Commits a static repository file with the fixed initial authorship metadata.
     pub fn commit_static(
         &mut self,
-        path: &str,
+        path: &RepoPathBuf,
         content: &[u8],
         message: &str,
         epoch: i64,
@@ -380,7 +406,7 @@ impl BareRepoWriter {
     /// Commits one file change after updating blob and tree state.
     fn commit_file(
         &mut self,
-        path: &str,
+        path: &RepoPathBuf,
         content: &[u8],
         message: &str,
         author: GitPerson<'_>,
@@ -390,9 +416,6 @@ impl BareRepoWriter {
         //
         // Store the file body first, preferably as a delta against the previous revision.
         //
-        if path.split('/').all(|part| part.is_empty()) {
-            bail!("invalid empty repository path");
-        }
         let blob_sha = git_hash(PackObjectKind::Blob.git_type_name(), content);
         if let Some(previous) = self.prev_blobs.get(path) {
             let previous_len = previous.content.len();
@@ -422,7 +445,7 @@ impl BareRepoWriter {
             self.writer.write_object(PackObjectKind::Blob, content)?;
         }
         self.prev_blobs.insert(
-            path.to_owned(),
+            path.clone(),
             PreviousBlob {
                 sha: blob_sha,
                 content: content.to_vec(),
@@ -432,23 +455,8 @@ impl BareRepoWriter {
         //
         // Update the logical tree state for either a root file or a kr/<group>/<file> leaf.
         //
-        let repo_path = {
-            let mut segments = path.split('/').filter(|segment| !segment.is_empty());
-            match (
-                segments.next(),
-                segments.next(),
-                segments.next(),
-                segments.next(),
-            ) {
-                (Some(name), None, None, None) => RepoPath::RootFile(name),
-                (Some("kr"), Some(group), Some(filename), None) => {
-                    RepoPath::KrFile { group, filename }
-                }
-                _ => bail!("unsupported repository path: {path}"),
-            }
-        };
-        match repo_path {
-            RepoPath::RootFile(name) => {
+        match path {
+            RepoPathBuf::RootFile(name) => {
                 let (index, inserted) =
                     upsert(&mut self.root.files, name.as_bytes(), blob_sha, false);
                 if inserted {
@@ -460,7 +468,7 @@ impl BareRepoWriter {
                 }
                 self.kr.dirty_group_index = None;
             }
-            RepoPath::KrFile { group, filename } => {
+            RepoPathBuf::KrFile { group, filename } => {
                 let group_index = self.ensure_group(group.as_bytes());
                 upsert(
                     &mut self.kr.groups[group_index].files,
@@ -1172,7 +1180,7 @@ mod tests {
         let (output, mut writer) = new_writer(&temp);
         writer
             .commit_law(
-                "kr/테스트법/법률.md",
+                &RepoPathBuf::kr_file("테스트법", "법률.md"),
                 b"body",
                 "message",
                 GitTimestampKst::from_promulgation_date("19491021").unwrap(),
@@ -1203,7 +1211,7 @@ mod tests {
         let result = (|| -> Result<()> {
             let mut writer = BareRepoWriter::create(Path::new("output.git"))?;
             writer.commit_law(
-                "kr/테스트법/법률.md",
+                &RepoPathBuf::kr_file("테스트법", "법률.md"),
                 b"body",
                 "message",
                 GitTimestampKst::from_promulgation_date("20240101")?,
@@ -1227,10 +1235,20 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (output, mut writer) = new_writer(&temp);
         writer
-            .commit_static("README.md", b"first\n", "initial commit", 1_774_839_600)
+            .commit_static(
+                &RepoPathBuf::root_file("README.md"),
+                b"first\n",
+                "initial commit",
+                1_774_839_600,
+            )
             .unwrap();
         writer
-            .commit_static("README.md", b"second\n", "update readme", 1_774_839_601)
+            .commit_static(
+                &RepoPathBuf::root_file("README.md"),
+                b"second\n",
+                "update readme",
+                1_774_839_601,
+            )
             .unwrap();
         writer.finish().unwrap();
 

@@ -5,6 +5,7 @@ use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 
+use crate::git_repo::RepoPathBuf;
 use crate::xml_parser::{LawDetail, LawMetadata};
 
 /// Child-law suffixes that share a parent directory in the output tree.
@@ -14,12 +15,12 @@ const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), ("
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
 pub struct PathRegistry {
     /// Already assigned paths keyed by the final repository path.
-    assigned: HashMap<String, (String, String)>,
+    assigned: HashMap<RepoPathBuf, (String, String)>,
 }
 
 impl PathRegistry {
     /// Returns the Markdown path for a law name/type pair.
-    pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
+    pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> RepoPathBuf {
         //
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
         // directory instead of getting their own top-level group names.
@@ -42,11 +43,11 @@ impl PathRegistry {
         // Reuse the plain `<group>/<filename>.md` path when the law name/type pair matches the
         // previous claimant; otherwise append `(법종)` exactly like the legacy repository did.
         //
-        let base = format!("kr/{group}/{filename}.md");
+        let base = RepoPathBuf::kr_file(&group, format!("{filename}.md"));
         if let Some(existing) = self.assigned.get(&base)
             && existing != &(law_name.to_owned(), law_type.to_owned())
         {
-            let qualified = format!("kr/{group}/{filename}({law_type}).md");
+            let qualified = RepoPathBuf::kr_file(&group, format!("{filename}({law_type}).md"));
             self.assigned.insert(
                 qualified.clone(),
                 (law_name.to_owned(), law_type.to_owned()),
@@ -423,11 +424,11 @@ mod tests {
         let mut registry = PathRegistry::default();
         assert_eq!(
             registry.get_law_path("테스트법 시행규칙", "부령"),
-            "kr/테스트법/시행규칙.md"
+            RepoPathBuf::kr_file("테스트법", "시행규칙.md")
         );
         assert_eq!(
             registry.get_law_path("테스트법 시행규칙", "총리령"),
-            "kr/테스트법/시행규칙(총리령).md"
+            RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md")
         );
     }
 

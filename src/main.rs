@@ -23,7 +23,7 @@ use clap::Parser;
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::git_repo::{BareRepoWriter, GitTimestampKst};
+use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf};
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_only};
 
@@ -60,7 +60,7 @@ struct PlannedEntry {
     /// Law MST used for file lookup and stable ordering.
     mst: String,
     /// Final repository path assigned after collision handling.
-    path: String,
+    path: RepoPathBuf,
     /// Metadata collected during the cheap planning pass.
     metadata: LawMetadata,
 }
@@ -68,7 +68,7 @@ struct PlannedEntry {
 /// Fully rendered pass-2 output that is ready to commit.
 struct Rendered {
     /// Destination repository path for the Markdown file.
-    path: String,
+    path: RepoPathBuf,
     /// Final Markdown bytes stored in Git.
     markdown: Vec<u8>,
     /// Commit message for this revision.
@@ -154,7 +154,7 @@ fn run(cli: Cli) -> Result<()> {
 
                 Ok(Some(PlannedEntry {
                     mst,
-                    path: String::new(),
+                    path: RepoPathBuf::root_file(String::new()),
                     metadata,
                 }))
             })
@@ -230,7 +230,7 @@ fn run(cli: Cli) -> Result<()> {
     // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
     const INITIAL_COMMIT_EPOCH: i64 = 1_774_839_600;
     repo.commit_static(
-        "README.md",
+        &RepoPathBuf::root_file("README.md"),
         REPOSITORY_README,
         "initial commit",
         INITIAL_COMMIT_EPOCH,
@@ -450,7 +450,7 @@ mod tests {
 
                 entries.push(PlannedEntry {
                     mst,
-                    path: String::new(),
+                    path: RepoPathBuf::root_file(String::new()),
                     metadata,
                 });
             }
@@ -493,11 +493,14 @@ mod tests {
         };
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].mst, "1");
-        assert_eq!(entries[0].path, "kr/테스트법/법률.md");
+        assert_eq!(entries[0].path, RepoPathBuf::kr_file("테스트법", "법률.md"));
         assert_eq!(entries[1].mst, "2");
-        assert_eq!(entries[1].path, "kr/테스트법/법률.md");
+        assert_eq!(entries[1].path, RepoPathBuf::kr_file("테스트법", "법률.md"));
         assert_eq!(entries[2].mst, "10");
-        assert_eq!(entries[2].path, "kr/테스트법/시행령.md");
+        assert_eq!(
+            entries[2].path,
+            RepoPathBuf::kr_file("테스트법", "시행령.md")
+        );
     }
 
     #[test]
