@@ -1,9 +1,13 @@
-use std::fs;
-use std::io::{BufWriter, Write};
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Child, ChildStdin, Command, Output, Stdio};
+use std::process::{self, Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use openssl::sha;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
 const MAIN_BRANCH: &str = "main";
@@ -15,6 +19,9 @@ const INITIAL_COMMIT_AUTHOR_EMAIL: &str = "reserve.dev@gmail.com";
 const INITIAL_COMMIT_CO_AUTHORS: &[(&str, &str)] = &[("Jihyeon Kim", "simnalamburt@gmail.com")];
 const INITIAL_COMMIT_COMMITTER_NAME: &str = "Jihyeon Kim";
 const INITIAL_COMMIT_COMMITTER_EMAIL: &str = "simnalamburt@gmail.com";
+const PACK_OBJECT_COMMIT: u8 = 1;
+const PACK_OBJECT_TREE: u8 = 2;
+const PACK_OBJECT_BLOB: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct GitPerson<'a> {
@@ -23,30 +30,41 @@ struct GitPerson<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FastImportTimestamp {
+struct GitTimestamp {
     epoch: i64,
     offset_minutes: i32,
 }
 
-struct CommitSpec<'a> {
-    author: GitPerson<'a>,
-    committer: GitPerson<'a>,
-    time: FastImportTimestamp,
-    message: &'a str,
-    file_update: Option<(u64, &'a str)>,
+#[derive(Debug, Clone)]
+struct Entry {
+    name: Vec<u8>,
+    sha: [u8; 20],
+    is_tree: bool,
 }
 
-struct FastImportProcess {
-    child: Child,
-    stdin: BufWriter<ChildStdin>,
+#[derive(Debug, Clone)]
+struct Group {
+    name: Vec<u8>,
+    files: Vec<Entry>,
+    cached_sha: Option<[u8; 20]>,
+}
+
+struct PackWriter {
+    file: BufWriter<File>,
+    object_count: u32,
+    path: PathBuf,
+    seen: HashSet<[u8; 20]>,
 }
 
 pub struct BareRepoWriter {
-    import: Option<FastImportProcess>,
+    writer: PackWriter,
     temp_output: PathBuf,
     final_output: PathBuf,
-    next_mark: u64,
-    parent_commit_mark: Option<u64>,
+    root_files: Vec<Entry>,
+    groups: Vec<Group>,
+    parent_commit: Option<[u8; 20]>,
+    current_root_sha: Option<[u8; 20]>,
+    tree_dirty: bool,
 }
 
 impl BareRepoWriter {
@@ -64,15 +82,23 @@ impl BareRepoWriter {
             .with_context(|| format!("failed to create {}", parent.display()))?;
 
         init_bare_repo(&temp_output)?;
-        let mut import = FastImportProcess::spawn(&temp_output)?;
-        import.write_feature_done()?;
+
+        let pack_path = temp_output.join("objects/pack/tmp_pack.pack");
+        fs::create_dir_all(
+            pack_path
+                .parent()
+                .context("pack path unexpectedly missing parent")?,
+        )?;
 
         Ok(Self {
-            import: Some(import),
+            writer: PackWriter::new(&pack_path)?,
             temp_output,
             final_output,
-            next_mark: 1,
-            parent_commit_mark: None,
+            root_files: Vec::new(),
+            groups: Vec::new(),
+            parent_commit: None,
+            current_root_sha: None,
+            tree_dirty: false,
         })
     }
 
@@ -119,7 +145,7 @@ impl BareRepoWriter {
             &message,
             author,
             author,
-            FastImportTimestamp {
+            GitTimestamp {
                 epoch,
                 offset_minutes,
             },
@@ -132,27 +158,51 @@ impl BareRepoWriter {
         epoch: i64,
         offset_minutes: i32,
     ) -> Result<()> {
-        if self.parent_commit_mark.is_none() {
+        if self.parent_commit.is_none() {
             bail!("empty contributor commit requires an existing tree");
         }
         let author = GitPerson {
             name: INITIAL_COMMIT_COMMITTER_NAME,
             email: INITIAL_COMMIT_COMMITTER_EMAIL,
         };
-        self.commit_existing_tree(
+        let root_sha = self.root_tree_sha()?;
+        let commit_sha = self.write_commit(
+            root_sha,
             message,
             author,
             author,
-            FastImportTimestamp {
+            GitTimestamp {
                 epoch,
                 offset_minutes,
             },
-        )
+        )?;
+        self.parent_commit = Some(commit_sha);
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<()> {
-        if let Some(import) = self.import.take() {
-            import.finish()?;
+        self.writer.finish()?;
+
+        let pack_path = Path::new("objects/pack/tmp_pack.pack");
+        let output = git_command()
+            .arg("-C")
+            .arg(&self.temp_output)
+            .arg("index-pack")
+            .arg(pack_path)
+            .output()
+            .context("failed to run git index-pack")?;
+        ensure_command_success(output, "git index-pack")?;
+
+        if let Some(parent_commit) = self.parent_commit {
+            let output = git_command()
+                .arg("-C")
+                .arg(&self.temp_output)
+                .arg("update-ref")
+                .arg(MAIN_REF)
+                .arg(hex(&parent_commit))
+                .output()
+                .context("failed to run git update-ref")?;
+            ensure_command_success(output, "git update-ref")?;
         }
 
         if self.final_output.exists() {
@@ -175,134 +225,203 @@ impl BareRepoWriter {
         message: &str,
         author: GitPerson<'_>,
         committer: GitPerson<'_>,
-        time: FastImportTimestamp,
+        time: GitTimestamp,
     ) -> Result<()> {
         ensure_repo_path(path)?;
-        let blob_mark = self.next_mark();
-        let commit_mark = self.next_mark();
-        let parent_commit_mark = self.parent_commit_mark;
-        self.import_mut()?.write_blob(blob_mark, content)?;
-        self.import_mut()?.write_commit(
-            commit_mark,
-            parent_commit_mark,
-            CommitSpec {
-                author,
-                committer,
-                time,
-                message,
-                file_update: Some((blob_mark, path)),
+        let blob_sha = self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+
+        match path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [name] => {
+                upsert(&mut self.root_files, name.as_bytes(), blob_sha, false);
+            }
+            ["kr", group, filename] => {
+                let group_index = self.ensure_group(group.as_bytes());
+                upsert(
+                    &mut self.groups[group_index].files,
+                    filename.as_bytes(),
+                    blob_sha,
+                    false,
+                );
+                self.groups[group_index].cached_sha = None;
+            }
+            _ => bail!("unsupported repository path: {path}"),
+        }
+
+        self.tree_dirty = true;
+        let root_sha = self.root_tree_sha()?;
+        let commit_sha = self.write_commit(root_sha, message, author, committer, time)?;
+        self.parent_commit = Some(commit_sha);
+        Ok(())
+    }
+
+    fn ensure_group(&mut self, name: &[u8]) -> usize {
+        if let Some(index) = self.groups.iter().position(|group| group.name == name) {
+            return index;
+        }
+
+        let position = self
+            .groups
+            .partition_point(|group| group.name.as_slice() < name);
+        self.groups.insert(
+            position,
+            Group {
+                name: name.to_vec(),
+                files: Vec::new(),
+                cached_sha: None,
             },
-        )?;
-        self.parent_commit_mark = Some(commit_mark);
-        Ok(())
+        );
+        position
     }
 
-    fn commit_existing_tree(
-        &mut self,
-        message: &str,
-        author: GitPerson<'_>,
-        committer: GitPerson<'_>,
-        time: FastImportTimestamp,
-    ) -> Result<()> {
-        let commit_mark = self.next_mark();
-        let parent_commit_mark = self.parent_commit_mark;
-        self.import_mut()?.write_commit(
-            commit_mark,
-            parent_commit_mark,
-            CommitSpec {
-                author,
-                committer,
-                time,
-                message,
-                file_update: None,
-            },
-        )?;
-        self.parent_commit_mark = Some(commit_mark);
-        Ok(())
-    }
+    fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
+        if !self.tree_dirty
+            && let Some(sha) = self.current_root_sha
+        {
+            return Ok(sha);
+        }
 
-    fn import_mut(&mut self) -> Result<&mut FastImportProcess> {
-        self.import
-            .as_mut()
-            .context("fast-import process already finalized")
-    }
+        for group in &mut self.groups {
+            if group.cached_sha.is_some() {
+                continue;
+            }
+            let tree = tree_bytes(&group.files);
+            let sha = self.writer.write_object(PACK_OBJECT_TREE, &tree)?;
+            group.cached_sha = Some(sha);
+        }
 
-    fn next_mark(&mut self) -> u64 {
-        let mark = self.next_mark;
-        self.next_mark += 1;
-        mark
-    }
-}
+        let kr_tree = if self.groups.is_empty() {
+            None
+        } else {
+            let mut entries = Vec::with_capacity(self.groups.len());
+            for group in &self.groups {
+                entries.push(Entry {
+                    name: group.name.clone(),
+                    sha: group.cached_sha.context("missing cached subtree SHA")?,
+                    is_tree: true,
+                });
+            }
+            let tree = tree_bytes(&entries);
+            Some(self.writer.write_object(PACK_OBJECT_TREE, &tree)?)
+        };
 
-impl FastImportProcess {
-    fn spawn(repo_dir: &Path) -> Result<Self> {
-        let mut command = git_command();
-        command
-            .arg("-C")
-            .arg(repo_dir)
-            .arg("fast-import")
-            .arg("--quiet")
-            .arg("--date-format=raw-permissive")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        let mut root_entries =
+            Vec::with_capacity(self.root_files.len() + usize::from(kr_tree.is_some()));
+        for file in &self.root_files {
+            root_entries.push((&file.name[..], file.sha, false));
+        }
+        if let Some(kr_tree) = kr_tree {
+            root_entries.push((b"kr".as_slice(), kr_tree, true));
+        }
+        root_entries.sort_by(tree_sort_cmp);
 
-        let mut child = command.spawn().with_context(|| {
-            format!("failed to spawn git fast-import for {}", repo_dir.display())
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("failed to open git fast-import stdin")?;
+        let mut root_tree = Vec::new();
+        for (name, sha, is_tree) in root_entries {
+            root_tree.extend_from_slice(if is_tree { b"40000 " } else { b"100644 " });
+            root_tree.extend_from_slice(name);
+            root_tree.push(0);
+            root_tree.extend_from_slice(&sha);
+        }
 
-        Ok(Self {
-            child,
-            stdin: BufWriter::new(stdin),
-        })
-    }
-
-    fn write_feature_done(&mut self) -> Result<()> {
-        self.stdin.write_all(b"feature done\n")?;
-        Ok(())
-    }
-
-    fn write_blob(&mut self, mark: u64, content: &[u8]) -> Result<()> {
-        self.stdin.write_all(b"blob\n")?;
-        writeln!(self.stdin, "mark :{mark}")?;
-        write_data(&mut self.stdin, content)?;
-        Ok(())
+        let root_sha = self.writer.write_object(PACK_OBJECT_TREE, &root_tree)?;
+        self.current_root_sha = Some(root_sha);
+        self.tree_dirty = false;
+        Ok(root_sha)
     }
 
     fn write_commit(
         &mut self,
-        mark: u64,
-        parent_mark: Option<u64>,
-        spec: CommitSpec<'_>,
-    ) -> Result<()> {
-        writeln!(self.stdin, "commit {MAIN_REF}")?;
-        writeln!(self.stdin, "mark :{mark}")?;
-        write_person_line(&mut self.stdin, "author", spec.author, spec.time)?;
-        write_person_line(&mut self.stdin, "committer", spec.committer, spec.time)?;
-        write_data(&mut self.stdin, spec.message.as_bytes())?;
-        if let Some(parent_mark) = parent_mark {
-            writeln!(self.stdin, "from :{parent_mark}")?;
+        tree: [u8; 20],
+        message: &str,
+        author: GitPerson<'_>,
+        committer: GitPerson<'_>,
+        time: GitTimestamp,
+    ) -> Result<[u8; 20]> {
+        let tz = format_timezone_offset(time.offset_minutes);
+        let mut commit = format!("tree {}\n", hex(&tree));
+        if let Some(parent) = self.parent_commit {
+            commit.push_str(&format!("parent {}\n", hex(&parent)));
         }
-        if let Some((blob_mark, path)) = spec.file_update {
-            writeln!(self.stdin, "M 100644 :{blob_mark} {path}")?;
+        commit.push_str(&format!(
+            "author {} <{}> {} {tz}\n",
+            author.name, author.email, time.epoch
+        ));
+        commit.push_str(&format!(
+            "committer {} <{}> {} {tz}\n",
+            committer.name, committer.email, time.epoch
+        ));
+        commit.push('\n');
+        commit.push_str(message);
+        self.writer
+            .write_object(PACK_OBJECT_COMMIT, commit.as_bytes())
+    }
+}
+
+impl PackWriter {
+    fn new(path: &Path) -> Result<Self> {
+        let file = BufWriter::with_capacity(1 << 20, File::create(path)?);
+        let mut writer = Self {
+            file,
+            object_count: 0,
+            path: path.to_path_buf(),
+            seen: HashSet::new(),
+        };
+        writer.write_raw(b"PACK")?;
+        writer.write_raw(&2u32.to_be_bytes())?;
+        writer.write_raw(&0u32.to_be_bytes())?;
+        Ok(writer)
+    }
+
+    fn write_object(&mut self, object_type: u8, data: &[u8]) -> Result<[u8; 20]> {
+        let sha = git_hash(object_type_name(object_type), data);
+        if !self.seen.insert(sha) {
+            return Ok(sha);
         }
+
+        let mut header = ((object_type & 0b111) << 4) | (data.len() as u8 & 0x0f);
+        let mut remaining = data.len() >> 4;
+        if remaining > 0 {
+            header |= 0x80;
+        }
+        self.write_raw(&[header])?;
+        while remaining > 0 {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining > 0 {
+                byte |= 0x80;
+            }
+            self.write_raw(&[byte])?;
+        }
+        self.write_raw(&compress(data))?;
+        self.object_count += 1;
+        Ok(sha)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.file.flush()?;
+
+        {
+            let mut file = File::options().write(true).open(&self.path)?;
+            file.seek(SeekFrom::Start(8))?;
+            file.write_all(&self.object_count.to_be_bytes())?;
+            file.flush()?;
+        }
+
+        let digest = sha::sha1(&fs::read(&self.path)?);
+        File::options()
+            .append(true)
+            .open(&self.path)?
+            .write_all(&digest)?;
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
-        self.stdin.write_all(b"done\n")?;
-        self.stdin.flush()?;
-        drop(self.stdin);
-
-        let output = self
-            .child
-            .wait_with_output()
-            .context("failed waiting for git fast-import")?;
-        ensure_command_success(output, "git fast-import")
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.write_all(bytes)?;
+        Ok(())
     }
 }
 
@@ -384,38 +503,6 @@ fn ensure_command_success(output: Output, context: &str) -> Result<()> {
     )
 }
 
-fn write_person_line(
-    writer: &mut impl Write,
-    kind: &str,
-    person: GitPerson<'_>,
-    time: FastImportTimestamp,
-) -> Result<()> {
-    writeln!(
-        writer,
-        "{kind} {} <{}> {} {}",
-        person.name,
-        person.email,
-        time.epoch,
-        format_timezone_offset(time.offset_minutes)
-    )?;
-    Ok(())
-}
-
-fn write_data(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
-    writeln!(writer, "data {}", bytes.len())?;
-    writer.write_all(bytes)?;
-    writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn format_timezone_offset(offset_minutes: i32) -> String {
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let total_minutes = offset_minutes.abs();
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
-    format!("{sign}{hours:02}{minutes:02}")
-}
-
 fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> String {
     if co_authors.is_empty() {
         return message.to_owned();
@@ -454,7 +541,98 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn commit_time(promulgation_date: &str) -> Result<FastImportTimestamp> {
+fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) {
+    match entries.iter().position(|entry| entry.name == name) {
+        Some(index) => entries[index].sha = sha,
+        None => {
+            let index = entries.partition_point(|entry| entry.name.as_slice() < name);
+            entries.insert(
+                index,
+                Entry {
+                    name: name.to_vec(),
+                    sha,
+                    is_tree,
+                },
+            );
+        }
+    }
+}
+
+fn tree_bytes(entries: &[Entry]) -> Vec<u8> {
+    let mut tree = Vec::new();
+    for entry in entries {
+        tree.extend_from_slice(if entry.is_tree { b"40000 " } else { b"100644 " });
+        tree.extend_from_slice(&entry.name);
+        tree.push(0);
+        tree.extend_from_slice(&entry.sha);
+    }
+    tree
+}
+
+fn tree_sort_cmp(
+    left: &(&[u8], [u8; 20], bool),
+    right: &(&[u8], [u8; 20], bool),
+) -> std::cmp::Ordering {
+    let common = left.0.len().min(right.0.len());
+    match left.0[..common].cmp(&right.0[..common]) {
+        std::cmp::Ordering::Equal => {
+            let left_tail = if left.2 { b'/' } else { 0 };
+            let right_tail = if right.2 { b'/' } else { 0 };
+            let left_next = left.0.get(common).copied().unwrap_or(left_tail);
+            let right_next = right.0.get(common).copied().unwrap_or(right_tail);
+            left_next.cmp(&right_next)
+        }
+        other => other,
+    }
+}
+
+fn compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+    encoder
+        .write_all(data)
+        .expect("zlib write to Vec cannot fail");
+    encoder.finish().expect("zlib finish on Vec cannot fail")
+}
+
+fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
+    let header = format!(
+        "{} {}\0",
+        std::str::from_utf8(type_name).expect("invalid object type name"),
+        data.len()
+    );
+    let mut hasher = sha::Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(data);
+    hasher.finish()
+}
+
+fn object_type_name(object_type: u8) -> &'static [u8] {
+    match object_type {
+        PACK_OBJECT_COMMIT => b"commit",
+        PACK_OBJECT_TREE => b"tree",
+        PACK_OBJECT_BLOB => b"blob",
+        _ => panic!("invalid object type {object_type}"),
+    }
+}
+
+fn hex(sha: &[u8; 20]) -> String {
+    let mut encoded = String::with_capacity(40);
+    for byte in sha {
+        use std::fmt::Write as _;
+        write!(encoded, "{byte:02x}").expect("formatting into String cannot fail");
+    }
+    encoded
+}
+
+fn format_timezone_offset(offset_minutes: i32) -> String {
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let total_minutes = offset_minutes.abs();
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    format!("{sign}{hours:02}{minutes:02}")
+}
+
+fn commit_time(promulgation_date: &str) -> Result<GitTimestamp> {
     let effective_date = if promulgation_date.len() == 8
         && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -483,7 +661,7 @@ fn commit_time(promulgation_date: &str) -> Result<FastImportTimestamp> {
     let date = Date::from_calendar_date(year, month, day)?;
     let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
     let offset = UtcOffset::from_hms(9, 0, 0)?;
-    Ok(FastImportTimestamp {
+    Ok(GitTimestamp {
         epoch: datetime.assume_offset(offset).unix_timestamp(),
         offset_minutes: 9 * 60,
     })
@@ -509,6 +687,29 @@ mod tests {
         let date = git_stdout(&output, ["show", "-s", "--format=%ai", "HEAD"]);
         assert_eq!(epoch.trim(), "10800");
         assert_eq!(date.trim(), "1970-01-01 12:00:00 +0900");
+    }
+
+    #[test]
+    fn finish_supports_relative_output_paths() {
+        let temp = TempDir::new().unwrap();
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            let mut writer = BareRepoWriter::create(Path::new("output.git"))?;
+            writer.commit_law("kr/테스트법/법률.md", b"body", "message", "20240101")?;
+            writer.finish()?;
+            Ok(())
+        })();
+
+        std::env::set_current_dir(previous_dir).unwrap();
+        result.unwrap();
+
+        let output = temp.path().join("output.git");
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "1"
+        );
     }
 
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
