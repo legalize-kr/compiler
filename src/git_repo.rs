@@ -24,6 +24,9 @@ const PACK_OBJECT_TREE: u8 = 2;
 const PACK_OBJECT_BLOB: u8 = 3;
 const BLOCK_SIZE: usize = 16;
 const INDEX_STEP: usize = 16;
+// Small blobs and very different revisions usually lose to the HashMap-heavy delta builder.
+const MIN_DELTA_BLOB_BYTES: usize = 128;
+const MAX_DELTA_BLOB_SIZE_RATIO: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct GitPerson<'a> {
@@ -287,10 +290,29 @@ impl BareRepoWriter {
         ensure_repo_path(path)?;
         let blob_sha = git_hash(object_type_name(PACK_OBJECT_BLOB), content);
         if let Some(previous) = self.prev_blobs.get(path) {
-            let delta = create_delta(&previous.content, content);
-            if delta.len() < content.len() * 3 / 4 {
-                self.writer
-                    .write_ref_delta(previous.sha, &delta, blob_sha)?;
+            let previous_len = previous.content.len();
+            let current_len = content.len();
+            let (smaller, larger) = if previous_len <= current_len {
+                (previous_len, current_len)
+            } else {
+                (current_len, previous_len)
+            };
+
+            //
+            // Skip expensive delta construction for cases that almost never compress well:
+            // identical blobs, very small bodies, or revisions whose sizes diverged too much.
+            //
+            if previous.sha != blob_sha
+                && smaller >= MIN_DELTA_BLOB_BYTES
+                && larger <= smaller.saturating_mul(MAX_DELTA_BLOB_SIZE_RATIO)
+            {
+                let delta = create_delta(&previous.content, content);
+                if delta.len() < content.len() * 3 / 4 {
+                    self.writer
+                        .write_ref_delta(previous.sha, &delta, blob_sha)?;
+                } else {
+                    self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+                }
             } else {
                 self.writer.write_object(PACK_OBJECT_BLOB, content)?;
             }
