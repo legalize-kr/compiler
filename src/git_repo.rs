@@ -519,7 +519,8 @@ impl BareRepoWriter {
     /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
         //
-        // Refresh per-group subtree SHAs only for groups whose file set changed.
+        // Refresh only the dirty subtree in the steady state. Full group scans are only needed
+        // when the `kr/` tree layout itself changed, such as the first time a new group appears.
         //
         if !self.tree_dirty
             && let Some(sha) = self.root.current_sha
@@ -527,14 +528,36 @@ impl BareRepoWriter {
             return Ok(sha);
         }
 
-        for group in &mut self.kr.groups {
-            if group.cached_sha.is_some() {
-                continue;
+        if self.kr.structure_dirty {
+            for group in &mut self.kr.groups {
+                if group.cached_sha.is_some() {
+                    continue;
+                }
+                //
+                // Group subtrees are only needed here, right before their SHA is refreshed. Keep
+                // the serialization local so the byte layout is visible at the call site where it
+                // matters: `100644/40000`, filename, NUL, then the child object id.
+                //
+                let tree = {
+                    let mut tree = Vec::new();
+                    for entry in &group.files {
+                        tree.extend_from_slice(if entry.is_tree { b"40000 " } else { b"100644 " });
+                        tree.extend_from_slice(&entry.name);
+                        tree.push(0);
+                        tree.extend_from_slice(&entry.sha);
+                    }
+                    tree
+                };
+                let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                group.cached_sha = Some(sha);
             }
+        } else if let Some(index) = self.kr.dirty_group_index
+            && self.kr.groups[index].cached_sha.is_none()
+        {
+            let group = &mut self.kr.groups[index];
             //
-            // Group subtrees are only needed here, right before their SHA is refreshed. Keep the
-            // serialization local so the byte layout is visible at the call site where it matters:
-            // `100644/40000`, filename, NUL, then the child object id.
+            // Most commits only touch one law file, so recomputing the affected subtree alone
+            // avoids scanning every cached group on the hot path.
             //
             let tree = {
                 let mut tree = Vec::new();
