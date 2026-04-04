@@ -92,6 +92,15 @@ pub struct LawDetail {
     pub addenda: Vec<Addendum>,
 }
 
+#[derive(Debug, Clone, Default)]
+/// Pass-2 article and addendum body extracted from a law XML document.
+pub struct LawBody {
+    /// Parsed article list.
+    pub articles: Vec<Article>,
+    /// Parsed addenda list.
+    pub addenda: Vec<Addendum>,
+}
+
 /// Minimal DOM node used for the full pass-2 XML walk.
 #[derive(Debug, Clone)]
 struct XmlNode {
@@ -120,22 +129,6 @@ impl XmlNode {
             .find(|child| child.name == name)
             .map(|child| child.text.clone())
             .unwrap_or_default()
-    }
-
-    /// Returns the first descendant text for the requested element name.
-    fn descendant_text(&self, name: &str) -> String {
-        if self.name == name {
-            return self.text.clone();
-        }
-
-        for child in &self.children {
-            let value = child.descendant_text(name);
-            if !value.is_empty() {
-                return value;
-            }
-        }
-
-        String::new()
     }
 
     /// Collects every descendant node whose element name matches `name`.
@@ -186,10 +179,12 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                         "법령명_한글" => metadata.law_name.is_empty(),
                         "법령ID" => metadata.law_id.is_empty(),
                         "법종구분" => metadata.law_type.is_empty(),
+                        "법종구분코드" => metadata.law_type_code.is_empty(),
                         "공포일자" => metadata.promulgation_date.is_empty(),
                         "공포번호" => metadata.promulgation_number.is_empty(),
                         "시행일자" => metadata.enforcement_date.is_empty(),
                         "소관부처명" => metadata.department_name.is_empty(),
+                        "제개정구분명" => metadata.amendment.is_empty(),
                         "법령분류명" => metadata.field.is_empty(),
                         _ => false,
                     };
@@ -227,10 +222,12 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                         "법령명_한글" => metadata.law_name = capture_text.clone(),
                         "법령ID" => metadata.law_id = capture_text.clone(),
                         "법종구분" => metadata.law_type = capture_text.clone(),
+                        "법종구분코드" => metadata.law_type_code = capture_text.clone(),
                         "공포일자" => metadata.promulgation_date = capture_text.clone(),
                         "공포번호" => metadata.promulgation_number = capture_text.clone(),
                         "시행일자" => metadata.enforcement_date = capture_text.clone(),
                         "소관부처명" => metadata.department_name = capture_text.clone(),
+                        "제개정구분명" => metadata.amendment = capture_text.clone(),
                         "법령분류명" => metadata.field = capture_text.clone(),
                         _ => {}
                     }
@@ -252,8 +249,8 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
     Ok(metadata)
 }
 
-/// Parses a full law XML document into the renderer's intermediate structure.
-pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
+/// Parses only the article and addendum body needed during pass 2.
+pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
     //
     // Build a tiny DOM first so the later extraction logic can mirror ElementTree-style descendant
     // lookups without reparsing the byte stream for every field family.
@@ -309,22 +306,7 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
     };
 
     //
-    // Project top-level metadata from the cached DOM into the renderer's metadata shape.
-    //
-    let mut detail = LawDetail {
-        metadata: LawMetadata {
-            mst: mst.to_owned(),
-            law_name: root.descendant_text("법령명_한글"),
-            law_id: root.descendant_text("법령ID"),
-            law_type: root.descendant_text("법종구분"),
-            law_type_code: root.descendant_text("법종구분코드"),
-            department_name: root.descendant_text("소관부처명"),
-            promulgation_date: root.descendant_text("공포일자"),
-            promulgation_number: root.descendant_text("공포번호"),
-            enforcement_date: root.descendant_text("시행일자"),
-            amendment: root.descendant_text("제개정구분명"),
-            field: root.descendant_text("법령분류명"),
-        },
+    let mut body = LawBody {
         articles: Vec::new(),
         addenda: Vec::new(),
     };
@@ -375,7 +357,7 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
             article.paragraphs.push(paragraph);
         }
 
-        detail.articles.push(article);
+        body.articles.push(article);
     }
 
     //
@@ -384,12 +366,12 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
     let mut addendum_nodes = Vec::new();
     root.collect_descendants("부칙단위", &mut addendum_nodes);
     for node in addendum_nodes {
-        detail.addenda.push(Addendum {
+        body.addenda.push(Addendum {
             content: node.child_text("부칙내용"),
         });
     }
 
-    Ok(detail)
+    Ok(body)
 }
 
 /// Decodes one XML element name from UTF-8 bytes.
@@ -416,8 +398,10 @@ mod tests {
     <공포일자>19971213</공포일자>
     <공포번호>05453</공포번호>
     <법종구분>법률</법종구분>
+    <법종구분코드>010101</법종구분코드>
     <법령명_한글><![CDATA[주세법]]></법령명_한글>
     <시행일자>19980101</시행일자>
+    <제개정구분명>일부개정</제개정구분명>
     <연락부서><부서단위><소관부처명>재정경제부</소관부처명></부서단위></연락부서>
   </기본정보>
 </법령>"#;
@@ -425,6 +409,8 @@ mod tests {
         let metadata = parse_metadata_only(xml.as_bytes(), "5848").unwrap();
         assert_eq!(metadata.law_name, "주세법");
         assert_eq!(metadata.law_type, "법률");
+        assert_eq!(metadata.law_type_code, "010101");
+        assert_eq!(metadata.amendment, "일부개정");
         assert_eq!(metadata.department_name, "재정경제부");
         assert_eq!(metadata.mst, "5848");
     }
@@ -459,14 +445,12 @@ mod tests {
   </조문>
 </법령>"#;
 
-        let detail = parse_law_detail(xml.as_bytes(), "1").unwrap();
-        assert_eq!(detail.articles.len(), 1);
-        assert_eq!(detail.articles[0].paragraphs.len(), 1);
-        assert_eq!(detail.articles[0].paragraphs[0].subparagraphs.len(), 1);
+        let body = parse_law_body(xml.as_bytes()).unwrap();
+        assert_eq!(body.articles.len(), 1);
+        assert_eq!(body.articles[0].paragraphs.len(), 1);
+        assert_eq!(body.articles[0].paragraphs[0].subparagraphs.len(), 1);
         assert_eq!(
-            detail.articles[0].paragraphs[0].subparagraphs[0]
-                .items
-                .len(),
+            body.articles[0].paragraphs[0].subparagraphs[0].items.len(),
             1
         );
     }

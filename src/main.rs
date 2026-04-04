@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use crate::git_repo::BareRepoWriter;
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
-use crate::xml_parser::{LawMetadata, parse_law_detail, parse_metadata_only};
+use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_only};
 
 /// Bundled README payload for the synthetic initial commit.
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
@@ -304,9 +304,13 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
     let xml =
         fs::read(&xml_path).with_context(|| format!("failed to read {}", xml_path.display()))?;
-    let mut detail = parse_law_detail(&xml, &entry.mst)
-        .with_context(|| format!("failed to parse {}", xml_path.display()))?;
-    detail.metadata.amendment = entry.metadata.amendment.clone();
+    let body =
+        parse_law_body(&xml).with_context(|| format!("failed to parse {}", xml_path.display()))?;
+    let detail = LawDetail {
+        metadata: entry.metadata.clone(),
+        articles: body.articles,
+        addenda: body.addenda,
+    };
 
     let markdown = law_to_markdown(&detail)?;
     let message = build_commit_message(&detail.metadata, &entry.mst);
@@ -314,7 +318,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
         path: entry.path.clone(),
         markdown,
         message,
-        promulgation_date: detail.metadata.promulgation_date,
+        promulgation_date: detail.metadata.promulgation_date.clone(),
     })
 }
 
