@@ -22,6 +22,8 @@ const INITIAL_COMMIT_COMMITTER_EMAIL: &str = "simnalamburt@gmail.com";
 const PACK_OBJECT_COMMIT: u8 = 1;
 const PACK_OBJECT_TREE: u8 = 2;
 const PACK_OBJECT_BLOB: u8 = 3;
+const BLOCK_SIZE: usize = 16;
+const INDEX_STEP: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct GitPerson<'a> {
@@ -61,6 +63,7 @@ pub struct BareRepoWriter {
     temp_output: PathBuf,
     final_output: PathBuf,
     root_files: Vec<Entry>,
+    prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
     groups: Vec<Group>,
     group_indices: HashMap<Vec<u8>, usize>,
     kr_tree_cache: Vec<u8>,
@@ -101,6 +104,7 @@ impl BareRepoWriter {
             temp_output,
             final_output,
             root_files: Vec::new(),
+            prev_blobs: HashMap::new(),
             groups: Vec::new(),
             group_indices: HashMap::new(),
             kr_tree_cache: Vec::new(),
@@ -240,7 +244,19 @@ impl BareRepoWriter {
         time: GitTimestamp,
     ) -> Result<()> {
         ensure_repo_path(path)?;
-        let blob_sha = self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+        let blob_sha = git_hash(object_type_name(PACK_OBJECT_BLOB), content);
+        if let Some((base_sha, base_content)) = self.prev_blobs.get(path) {
+            let delta = create_delta(base_content, content);
+            if delta.len() < content.len() * 3 / 4 {
+                self.writer.write_ref_delta(*base_sha, &delta, blob_sha)?;
+            } else {
+                self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+            }
+        } else {
+            self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+        }
+        self.prev_blobs
+            .insert(path.to_owned(), (blob_sha, content.to_vec()));
 
         match path
             .split('/')
@@ -687,6 +703,57 @@ fn compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("zlib finish on Vec cannot fail")
 }
 
+fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    let mut delta = Vec::with_capacity(dst.len() / 2);
+    encode_varint(&mut delta, src.len());
+    encode_varint(&mut delta, dst.len());
+
+    if src.len() < BLOCK_SIZE {
+        emit_inserts(&mut delta, dst);
+        return delta;
+    }
+
+    let mut index = HashMap::<u32, Vec<usize>>::new();
+    for source_offset in (0..src.len().saturating_sub(BLOCK_SIZE - 1)).step_by(INDEX_STEP) {
+        let hash = block_hash(&src[source_offset..source_offset + BLOCK_SIZE]);
+        index.entry(hash).or_default().push(source_offset);
+    }
+
+    let mut destination_offset = 0usize;
+    let mut pending = Vec::new();
+
+    while destination_offset < dst.len() {
+        let mut best_source_offset = 0usize;
+        let mut best_len = 0usize;
+        let remaining = dst.len() - destination_offset;
+
+        if remaining >= BLOCK_SIZE {
+            let hash = block_hash(&dst[destination_offset..destination_offset + BLOCK_SIZE]);
+            if let Some(candidates) = index.get(&hash) {
+                for &source_offset in candidates {
+                    let match_len = match_length(src, source_offset, dst, destination_offset);
+                    if match_len > best_len {
+                        best_len = match_len;
+                        best_source_offset = source_offset;
+                    }
+                }
+            }
+        }
+
+        if best_len >= BLOCK_SIZE {
+            flush_inserts(&mut delta, &mut pending);
+            emit_copy(&mut delta, best_source_offset, best_len);
+            destination_offset += best_len;
+        } else {
+            pending.push(dst[destination_offset]);
+            destination_offset += 1;
+        }
+    }
+
+    flush_inserts(&mut delta, &mut pending);
+    delta
+}
+
 fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Vec<u8> {
     let mut delta = Vec::with_capacity(64);
     encode_varint(&mut delta, total);
@@ -741,6 +808,41 @@ fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
     }
     out.push(command);
     out.extend_from_slice(&args);
+}
+
+fn block_hash(data: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for &byte in data {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+fn match_length(src: &[u8], src_offset: usize, dst: &[u8], dst_offset: usize) -> usize {
+    let max = std::cmp::min(src.len() - src_offset, dst.len() - dst_offset);
+    let mut len = 0usize;
+    while len < max && src[src_offset + len] == dst[dst_offset + len] {
+        len += 1;
+    }
+    len
+}
+
+fn emit_inserts(out: &mut Vec<u8>, data: &[u8]) {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let chunk_len = std::cmp::min(127, data.len() - offset);
+        out.push(chunk_len as u8);
+        out.extend_from_slice(&data[offset..offset + chunk_len]);
+        offset += chunk_len;
+    }
+}
+
+fn flush_inserts(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        emit_inserts(out, pending);
+        pending.clear();
+    }
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
@@ -844,6 +946,14 @@ mod tests {
         let date = git_stdout(&output, ["show", "-s", "--format=%ai", "HEAD"]);
         assert_eq!(epoch.trim(), "10800");
         assert_eq!(date.trim(), "1970-01-01 12:00:00 +0900");
+    }
+
+    #[test]
+    fn blob_delta_is_smaller_for_similar_versions() {
+        let before = b"# test\n\nalpha\nbeta\ngamma\n";
+        let after = b"# test\n\nalpha\nbeta\ngamma\ndelta\n";
+        let delta = create_delta(before, after);
+        assert!(delta.len() < after.len());
     }
 
     #[test]
