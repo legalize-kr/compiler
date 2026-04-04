@@ -134,11 +134,14 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
             law_id: detail.metadata.law_id.clone(),
             law_type: detail.metadata.law_type.clone(),
             law_type_code: detail.metadata.law_type_code.clone(),
+            // Keep the legacy empty-list rendering when no department is present instead of
+            // serializing a single empty string item.
             departments: detail
                 .metadata
                 .department_name
                 .split(',')
                 .map(str::trim)
+                .filter(|department| !department.is_empty())
                 .map(ToOwned::to_owned)
                 .collect(),
             promulgation_date: format_date(&detail.metadata.promulgation_date)?,
@@ -463,5 +466,27 @@ mod tests {
 
         let error = law_to_markdown(&detail).unwrap_err();
         assert!(error.to_string().contains("YYYYMMDD"));
+    }
+
+    #[test]
+    fn markdown_keeps_empty_departments_as_empty_list() {
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                mst: String::from("1"),
+                law_name: String::from("테스트법"),
+                law_id: String::from("000001"),
+                law_type: String::from("법률"),
+                promulgation_date: String::from("20240101"),
+                promulgation_number: String::from("00001"),
+                enforcement_date: String::from("20240101"),
+                department_name: String::new(),
+                ..LawMetadata::default()
+            },
+            ..LawDetail::default()
+        };
+
+        let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
+        assert!(markdown.contains("소관부처: []"));
+        assert!(!markdown.contains("소관부처:\n- ''"));
     }
 }
