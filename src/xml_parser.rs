@@ -4,57 +4,91 @@ use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
 #[derive(Debug, Clone, Default)]
+/// Metadata extracted from one 법령 XML document.
 pub struct LawMetadata {
+    /// 법령일련번호 (MST).
     pub mst: String,
+    /// 법령명_한글.
     pub law_name: String,
+    /// 법령ID.
     pub law_id: String,
+    /// 법종구분.
     pub law_type: String,
+    /// 법종구분코드.
     pub law_type_code: String,
+    /// 소관부처명.
     pub department_name: String,
+    /// 공포일자.
     pub promulgation_date: String,
+    /// 공포번호.
     pub promulgation_number: String,
+    /// 시행일자.
     pub enforcement_date: String,
+    /// 제개정구분명.
     pub amendment: String,
+    /// 법령분류명.
     pub field: String,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Lowest-level numbered item inside a subparagraph.
 pub struct Item {
+    /// Display number such as `가.`.
     pub number: String,
+    /// Rendered item body text.
     pub content: String,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Numbered subdivision inside a paragraph.
 pub struct Subparagraph {
+    /// Display number such as `1.`.
     pub number: String,
+    /// Rendered subparagraph body text.
     pub content: String,
+    /// Nested item list.
     pub items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Paragraph within an article.
 pub struct Paragraph {
+    /// Display number such as `①`.
     pub number: String,
+    /// Rendered paragraph body text.
     pub content: String,
+    /// Nested subparagraph list.
     pub subparagraphs: Vec<Subparagraph>,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Article in the main body of a law.
 pub struct Article {
+    /// Article number without the `조` suffix.
     pub number: String,
+    /// Optional article title.
     pub title: String,
+    /// Leading article text before numbered paragraphs.
     pub content: String,
+    /// Paragraph list under the article.
     pub paragraphs: Vec<Paragraph>,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Addendum block from a law document.
 pub struct Addendum {
+    /// Rendered addendum text.
     pub content: String,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Fully parsed law document ready for Markdown rendering.
 pub struct LawDetail {
+    /// Top-level metadata used for file naming and frontmatter.
     pub metadata: LawMetadata,
+    /// Parsed article list.
     pub articles: Vec<Article>,
+    /// Parsed addenda list.
     pub addenda: Vec<Addendum>,
 }
 
@@ -107,6 +141,7 @@ impl XmlNode {
     }
 }
 
+/// Parses only the metadata fields needed for pass-1 ordering and path planning.
 pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -194,6 +229,7 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
     Ok(metadata)
 }
 
+/// Parses a full law XML document into the renderer's intermediate structure.
 pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
     let root = {
         let mut reader = Reader::from_reader(xml);

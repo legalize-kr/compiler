@@ -10,11 +10,13 @@ use crate::xml_parser::{LawDetail, LawMetadata};
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
 
 #[derive(Debug, Default)]
+/// Tracks already-assigned output paths so collisions follow the legacy rules.
 pub struct PathRegistry {
     assigned: HashMap<String, (String, String)>,
 }
 
 impl PathRegistry {
+    /// Returns the Markdown path for a law name/type pair.
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law directory.
         let (group, filename) = {
@@ -48,6 +50,7 @@ impl PathRegistry {
     }
 }
 
+/// Normalizes punctuation variants so rendered names match the legacy output.
 pub fn normalize_law_name(name: &str) -> String {
     name.chars()
         .map(|ch| match ch {
@@ -57,6 +60,7 @@ pub fn normalize_law_name(name: &str) -> String {
         .collect()
 }
 
+/// Formats `YYYYMMDD` values as `YYYY-MM-DD` when possible.
 pub fn format_date(date: &str) -> String {
     if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) {
         format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8])
@@ -65,6 +69,7 @@ pub fn format_date(date: &str) -> String {
     }
 }
 
+/// Builds the Git commit message for one law revision.
 pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
     let normalized = normalize_law_name(&metadata.law_name);
     let compact = normalized.replace(' ', "");
@@ -107,6 +112,7 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
     lines.join("\n")
 }
 
+/// Renders one parsed law document into the repository Markdown format.
 pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     // Render YAML from the same metadata fields the Python pipeline emits.
     let frontmatter = {

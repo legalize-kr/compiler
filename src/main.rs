@@ -1,3 +1,10 @@
+//! Builds a fresh bare Git repository from cached law.go.kr XML and JSON files.
+//!
+//! The compiler reads an existing `.cache` tree in two passes:
+//! metadata is collected and stably sorted first, then each XML document is
+//! fully parsed, rendered to Markdown, and committed into a new bare repo.
+#![deny(missing_docs)]
+
 mod git_repo;
 mod render;
 mod xml_parser;
@@ -70,6 +77,9 @@ fn run(cli: Cli) -> Result<()> {
         anyhow::bail!("detail cache not found: {}", detail_dir.display());
     }
 
+    //
+    // Load history-side amendment labels before planning commit order.
+    //
     eprintln!("loading amendment history...");
     // History JSON overrides the amendment labels embedded in detail XML.
     let history = {
@@ -94,8 +104,10 @@ fn run(cli: Cli) -> Result<()> {
         }
     };
 
+    //
+    // Pass 1 only touches metadata so every later full parse follows one stable order.
+    //
     eprintln!("pass 1/2: scanning cache metadata...");
-    // Pass 1 only reads XML metadata so the final full parse can follow a stable order.
     let entries = {
         let files = read_sorted_files(&detail_dir, "xml")?;
         let parsed = files
@@ -184,6 +196,9 @@ fn run(cli: Cli) -> Result<()> {
         anyhow::bail!("no valid XML entries found under {}", detail_dir.display());
     }
 
+    //
+    // Seed the synthetic history commits that always come before law revisions.
+    //
     eprintln!(
         "writing {} commits to {}...",
         entries.len(),
@@ -209,6 +224,9 @@ fn run(cli: Cli) -> Result<()> {
     )?;
     eprintln!("  committed contributor marker");
 
+    //
+    // Parse/render chunks in parallel while the main thread keeps Git writes ordered.
+    //
     let total = entries.len();
     let chunks: Vec<&[PlannedEntry]> = entries.chunks(CHUNK_SIZE).collect();
     let mut pending: Option<Vec<Result<Rendered>>> = None;
@@ -263,6 +281,7 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
+    // Pass 2 does the expensive XML parse only after pass 1 has fixed the final order and path.
     let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
     let xml =
         fs::read(&xml_path).with_context(|| format!("failed to read {}", xml_path.display()))?;

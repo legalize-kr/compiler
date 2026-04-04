@@ -58,6 +58,8 @@ enum DirtyRootEntry {
 }
 
 struct PackWriter {
+    // Object payloads are buffered separately so finish() can stream a final pack
+    // header with the real object count instead of patching bytes in place.
     body_file: BufWriter<File>,
     body_path: PathBuf,
     object_count: u32,
@@ -65,15 +67,20 @@ struct PackWriter {
     seen: HashSet<[u8; 20]>,
 }
 
+/// Writes the generated law history into a fresh bare Git repository.
 pub struct BareRepoWriter {
     writer: PackWriter,
     temp_output: PathBuf,
     final_output: PathBuf,
+
+    // Root-level files plus the cached serialized root tree used for REF_DELTA updates.
     root_files: Vec<Entry>,
     root_tree_cache: Vec<u8>,
     root_tree_sha_offsets: Vec<usize>,
     root_tree_kr_sha_offset: Option<usize>,
     dirty_root_entry: Option<DirtyRootEntry>,
+
+    // Blob and subtree history that lets repeated law revisions reuse previous objects.
     prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
     groups: Vec<Group>,
     group_indices: HashMap<Vec<u8>, usize>,
@@ -88,6 +95,7 @@ pub struct BareRepoWriter {
 }
 
 impl BareRepoWriter {
+    /// Creates a new temporary bare repository writer for the requested output path.
     pub fn create(output: &Path) -> Result<Self> {
         let final_output = output.to_path_buf();
         let temp_output = make_temp_output_path(output)?;
@@ -133,6 +141,7 @@ impl BareRepoWriter {
         })
     }
 
+    /// Commits one rendered law Markdown file using bot authorship and law dates.
     pub fn commit_law(
         &mut self,
         path: &str,
@@ -157,6 +166,7 @@ impl BareRepoWriter {
         )
     }
 
+    /// Commits a static repository file with the fixed initial authorship metadata.
     pub fn commit_static(
         &mut self,
         path: &str,
@@ -183,6 +193,7 @@ impl BareRepoWriter {
         )
     }
 
+    /// Appends the empty historical contributor commit after the initial static files.
     pub fn commit_empty_initial_contributor(
         &mut self,
         message: &str,
@@ -211,6 +222,7 @@ impl BareRepoWriter {
         Ok(())
     }
 
+    /// Finalizes the pack, updates `main`, and moves the temporary repo into place.
     pub fn finish(mut self) -> Result<()> {
         self.writer.finish()?;
 
@@ -258,6 +270,9 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestamp,
     ) -> Result<()> {
+        //
+        // Store the file body first, preferably as a delta against the previous revision.
+        //
         ensure_repo_path(path)?;
         let blob_sha = git_hash(object_type_name(PACK_OBJECT_BLOB), content);
         if let Some((base_sha, base_content)) = self.prev_blobs.get(path) {
@@ -273,6 +288,9 @@ impl BareRepoWriter {
         self.prev_blobs
             .insert(path.to_owned(), (blob_sha, content.to_vec()));
 
+        //
+        // Update the logical tree state for either a root file or a kr/<group>/<file> leaf.
+        //
         match path
             .split('/')
             .filter(|segment| !segment.is_empty())
@@ -306,6 +324,9 @@ impl BareRepoWriter {
             _ => bail!("unsupported repository path: {path}"),
         }
 
+        //
+        // Materialize the current root tree and append the commit object in order.
+        //
         self.tree_dirty = true;
         let root_sha = self.root_tree_sha()?;
         let commit_sha = self.write_commit(root_sha, message, author, committer, time)?;
@@ -340,6 +361,9 @@ impl BareRepoWriter {
     }
 
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
+        //
+        // Refresh per-group subtree SHAs only for groups whose file set changed.
+        //
         if !self.tree_dirty
             && let Some(sha) = self.current_root_sha
         {
@@ -355,6 +379,9 @@ impl BareRepoWriter {
             group.cached_sha = Some(sha);
         }
 
+        //
+        // Rebuild or patch the cached kr/ tree, then remember its current object SHA.
+        //
         let kr_tree = if self.groups.is_empty() {
             self.kr_tree_cache.clear();
             self.kr_tree_sha_offsets.clear();
@@ -412,6 +439,9 @@ impl BareRepoWriter {
             }
         };
 
+        //
+        // Rebuild or patch the cached root tree bytes in the same way.
+        //
         let root_structure_dirty = self.root_tree_sha_offsets.len() != self.root_files.len()
             || self.root_tree_kr_sha_offset.is_some() != kr_tree.is_some();
         let root_sha = if root_structure_dirty {
@@ -496,6 +526,7 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestamp,
     ) -> Result<[u8; 20]> {
+        // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let tz = format_timezone_offset(time.offset_minutes);
         let mut commit = format!("tree {}\n", hex(&tree));
         if let Some(parent) = self.parent_commit {
@@ -530,11 +561,17 @@ impl PackWriter {
     }
 
     fn write_object(&mut self, object_type: u8, data: &[u8]) -> Result<[u8; 20]> {
+        //
+        // Hash first so repeated trees/blobs/commits can be skipped entirely in the pack stream.
+        //
         let sha = git_hash(object_type_name(object_type), data);
         if !self.seen.insert(sha) {
             return Ok(sha);
         }
 
+        //
+        // PACK object headers use a variable-length size encoding ahead of the compressed body.
+        //
         let mut header = ((object_type & 0b111) << 4) | (data.len() as u8 & 0x0f);
         let mut remaining = data.len() >> 4;
         if remaining > 0 {
@@ -564,6 +601,7 @@ impl PackWriter {
             return Ok(result_sha);
         }
 
+        // REF_DELTA stores the base object id before the compressed delta payload.
         let mut header = (7u8 << 4) | (delta.len() as u8 & 0x0f);
         let mut remaining = delta.len() >> 4;
         if remaining > 0 {
@@ -585,6 +623,9 @@ impl PackWriter {
     }
 
     fn finish(&mut self) -> Result<()> {
+        //
+        // Assemble the final pack in one streamed pass so finish() does not reread the whole file.
+        //
         self.body_file.flush()?;
 
         let mut output = BufWriter::with_capacity(1 << 20, File::create(&self.path)?);
@@ -806,6 +847,9 @@ fn compress(data: &[u8]) -> Vec<u8> {
 }
 
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    //
+    // Index fixed-size source blocks so destination scanning can prefer copy commands.
+    //
     let mut delta = Vec::with_capacity(dst.len() / 2);
     encode_varint(&mut delta, src.len());
     encode_varint(&mut delta, dst.len());
@@ -821,6 +865,9 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
         index.entry(hash).or_default().push(source_offset);
     }
 
+    //
+    // Walk the destination once, alternating between copy commands and literal inserts.
+    //
     let mut destination_offset = 0usize;
     let mut pending = Vec::new();
 
@@ -857,6 +904,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
 }
 
 fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Vec<u8> {
+    // Tree delta updates only swap one 20-byte SHA, so they can be expressed as copy/insert/copy.
     let mut delta = Vec::with_capacity(64);
     encode_varint(&mut delta, total);
     encode_varint(&mut delta, total);
@@ -878,6 +926,7 @@ fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Ve
 }
 
 fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
+    // PACK copy opcodes only encode the non-zero bytes of the offset and size fields.
     let mut command = 0x80;
     let mut args = Vec::with_capacity(7);
     if offset & 0xff != 0 {
