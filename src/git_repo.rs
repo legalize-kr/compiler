@@ -45,13 +45,11 @@ struct GitPerson<'a> {
     email: &'a str,
 }
 
-/// Commit timestamp with an explicit timezone offset.
+/// Commit timestamp that is always rendered in Korea Standard Time (`+0900`).
 #[derive(Debug, Clone, Copy)]
-struct GitTimestamp {
+struct GitTimestampKst {
     /// Unix timestamp in seconds.
     epoch: i64,
-    /// Timezone offset in minutes east of UTC.
-    offset_minutes: i32,
 }
 
 /// One tree entry inside either the root tree or a law group subtree.
@@ -250,7 +248,6 @@ impl BareRepoWriter {
         content: &[u8],
         message: &str,
         epoch: i64,
-        offset_minutes: i32,
     ) -> Result<()> {
         let message = {
             let mut rendered = String::from(message.trim_end());
@@ -268,20 +265,12 @@ impl BareRepoWriter {
             &message,
             author,
             author,
-            GitTimestamp {
-                epoch,
-                offset_minutes,
-            },
+            GitTimestampKst { epoch },
         )
     }
 
     /// Appends the empty historical contributor commit after the initial static files.
-    pub fn commit_empty_initial_contributor(
-        &mut self,
-        message: &str,
-        epoch: i64,
-        offset_minutes: i32,
-    ) -> Result<()> {
+    pub fn commit_empty_initial_contributor(&mut self, message: &str, epoch: i64) -> Result<()> {
         if self.parent_commit.is_none() {
             bail!("empty contributor commit requires an existing tree");
         }
@@ -290,16 +279,8 @@ impl BareRepoWriter {
             email: "simnalamburt@gmail.com",
         };
         let root_sha = self.root_tree_sha()?;
-        let commit_sha = self.write_commit(
-            root_sha,
-            message,
-            author,
-            author,
-            GitTimestamp {
-                epoch,
-                offset_minutes,
-            },
-        )?;
+        let commit_sha =
+            self.write_commit(root_sha, message, author, author, GitTimestampKst { epoch })?;
         self.parent_commit = Some(commit_sha);
         Ok(())
     }
@@ -351,7 +332,7 @@ impl BareRepoWriter {
         message: &str,
         author: GitPerson<'_>,
         committer: GitPerson<'_>,
-        time: GitTimestamp,
+        time: GitTimestampKst,
     ) -> Result<()> {
         //
         // Store the file body first, preferably as a delta against the previous revision.
@@ -642,26 +623,19 @@ impl BareRepoWriter {
         message: &str,
         author: GitPerson<'_>,
         committer: GitPerson<'_>,
-        time: GitTimestamp,
+        time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
-        let tz = {
-            let sign = if time.offset_minutes < 0 { '-' } else { '+' };
-            let total_minutes = time.offset_minutes.abs();
-            let hours = total_minutes / 60;
-            let minutes = total_minutes % 60;
-            format!("{sign}{hours:02}{minutes:02}")
-        };
         let mut commit = format!("tree {}\n", hex(&tree));
         if let Some(parent) = self.parent_commit {
             commit.push_str(&format!("parent {}\n", hex(&parent)));
         }
         commit.push_str(&format!(
-            "author {} <{}> {} {tz}\n",
+            "author {} <{}> {} +0900\n",
             author.name, author.email, time.epoch
         ));
         commit.push_str(&format!(
-            "committer {} <{}> {} {tz}\n",
+            "committer {} <{}> {} +0900\n",
             committer.name, committer.email, time.epoch
         ));
         commit.push('\n');
@@ -1146,7 +1120,7 @@ fn hex(sha: &[u8; 20]) -> String {
 }
 
 /// Converts a promulgation date into the deterministic noon-KST commit timestamp.
-fn commit_time(promulgation_date: &str) -> Result<GitTimestamp> {
+fn commit_time(promulgation_date: &str) -> Result<GitTimestampKst> {
     let effective_date = if promulgation_date.len() == 8
         && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -1175,9 +1149,8 @@ fn commit_time(promulgation_date: &str) -> Result<GitTimestamp> {
     let date = Date::from_calendar_date(year, month, day)?;
     let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
     let offset = UtcOffset::from_hms(9, 0, 0)?;
-    Ok(GitTimestamp {
+    Ok(GitTimestampKst {
         epoch: datetime.assume_offset(offset).unix_timestamp(),
-        offset_minutes: 9 * 60,
     })
 }
 
@@ -1250,22 +1223,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (output, mut writer) = new_writer(&temp);
         writer
-            .commit_static(
-                "README.md",
-                b"first\n",
-                "initial commit",
-                1_774_839_600,
-                540,
-            )
+            .commit_static("README.md", b"first\n", "initial commit", 1_774_839_600)
             .unwrap();
         writer
-            .commit_static(
-                "README.md",
-                b"second\n",
-                "update readme",
-                1_774_839_601,
-                540,
-            )
+            .commit_static("README.md", b"second\n", "update readme", 1_774_839_601)
             .unwrap();
         writer.finish().unwrap();
 

@@ -229,19 +229,16 @@ fn run(cli: Cli) -> Result<()> {
 
     // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
     const INITIAL_COMMIT_EPOCH: i64 = 1_774_839_600;
-    const INITIAL_COMMIT_OFFSET_MINUTES: i32 = 540;
     repo.commit_static(
         "README.md",
         REPOSITORY_README,
         "initial commit",
         INITIAL_COMMIT_EPOCH,
-        INITIAL_COMMIT_OFFSET_MINUTES,
     )?;
     eprintln!("  committed README.md");
     repo.commit_empty_initial_contributor(
         "Add @simnalamburt as a contributor",
         INITIAL_COMMIT_EPOCH,
-        INITIAL_COMMIT_OFFSET_MINUTES,
     )?;
     eprintln!("  committed contributor marker");
 
