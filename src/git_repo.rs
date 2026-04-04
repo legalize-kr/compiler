@@ -343,15 +343,22 @@ impl BareRepoWriter {
                 self.dirty_group_index = None;
                 Some(kr_tree_sha)
             } else if let Some(index) = self.dirty_group_index.take() {
+                let base_kr_tree_sha = self.current_kr_tree_sha;
                 let sha_offset = self.kr_tree_sha_offsets[index];
-                self.kr_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(
-                    &self.groups[index]
-                        .cached_sha
-                        .context("missing cached subtree SHA")?,
-                );
-                let kr_tree_sha = self
-                    .writer
-                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                let new_group_sha = self.groups[index]
+                    .cached_sha
+                    .context("missing cached subtree SHA")?;
+                let delta =
+                    make_copy_insert_delta(self.kr_tree_cache.len(), sha_offset, &new_group_sha);
+                self.kr_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(&new_group_sha);
+                let kr_tree_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.kr_tree_cache);
+                if let Some(base_kr_tree_sha) = base_kr_tree_sha {
+                    self.writer
+                        .write_ref_delta(base_kr_tree_sha, &delta, kr_tree_sha)?;
+                } else {
+                    self.writer
+                        .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                }
                 self.current_kr_tree_sha = Some(kr_tree_sha);
                 Some(kr_tree_sha)
             } else if let Some(kr_tree_sha) = self.current_kr_tree_sha {
@@ -455,6 +462,36 @@ impl PackWriter {
         self.write_raw(&compress(data))?;
         self.object_count += 1;
         Ok(sha)
+    }
+
+    fn write_ref_delta(
+        &mut self,
+        base_sha: [u8; 20],
+        delta: &[u8],
+        result_sha: [u8; 20],
+    ) -> Result<[u8; 20]> {
+        if !self.seen.insert(result_sha) {
+            return Ok(result_sha);
+        }
+
+        let mut header = (7u8 << 4) | (delta.len() as u8 & 0x0f);
+        let mut remaining = delta.len() >> 4;
+        if remaining > 0 {
+            header |= 0x80;
+        }
+        self.write_raw(&[header])?;
+        while remaining > 0 {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining > 0 {
+                byte |= 0x80;
+            }
+            self.write_raw(&[byte])?;
+        }
+        self.write_raw(&base_sha)?;
+        self.write_raw(&compress(delta))?;
+        self.object_count += 1;
+        Ok(result_sha)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -648,6 +685,70 @@ fn compress(data: &[u8]) -> Vec<u8> {
         .write_all(data)
         .expect("zlib write to Vec cannot fail");
     encoder.finish().expect("zlib finish on Vec cannot fail")
+}
+
+fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Vec<u8> {
+    let mut delta = Vec::with_capacity(64);
+    encode_varint(&mut delta, total);
+    encode_varint(&mut delta, total);
+
+    if offset > 0 {
+        emit_copy(&mut delta, 0, offset);
+    }
+
+    delta.push(20);
+    delta.extend_from_slice(new_sha);
+
+    let tail_offset = offset + 20;
+    let tail_size = total - tail_offset;
+    if tail_size > 0 {
+        emit_copy(&mut delta, tail_offset, tail_size);
+    }
+
+    delta
+}
+
+fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
+    let mut command = 0x80;
+    let mut args = Vec::with_capacity(7);
+    if offset & 0xff != 0 {
+        command |= 0x01;
+        args.push((offset & 0xff) as u8);
+    }
+    if offset & 0xff00 != 0 {
+        command |= 0x02;
+        args.push(((offset >> 8) & 0xff) as u8);
+    }
+    if offset & 0xff0000 != 0 {
+        command |= 0x04;
+        args.push(((offset >> 16) & 0xff) as u8);
+    }
+    if offset & 0xff000000 != 0 {
+        command |= 0x08;
+        args.push(((offset >> 24) & 0xff) as u8);
+    }
+    if size & 0xff != 0 {
+        command |= 0x10;
+        args.push((size & 0xff) as u8);
+    }
+    if size & 0xff00 != 0 {
+        command |= 0x20;
+        args.push(((size >> 8) & 0xff) as u8);
+    }
+    if size & 0xff0000 != 0 {
+        command |= 0x40;
+        args.push(((size >> 16) & 0xff) as u8);
+    }
+    out.push(command);
+    out.extend_from_slice(&args);
+}
+
+fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
+    while value >= 128 {
+        out.push((value & 0x7f) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
