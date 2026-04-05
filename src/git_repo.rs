@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -8,6 +7,7 @@ use std::process::{self, Command, Output};
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use sha1::{Digest, Sha1};
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
@@ -289,7 +289,7 @@ impl BareRepoWriter {
             temp_output,
             final_output,
             root: RootTreeState::default(),
-            prev_blobs: HashMap::new(),
+            prev_blobs: HashMap::default(),
             kr: KrTreeState::default(),
             parent_commit: None,
             tree_dirty: false,
@@ -763,7 +763,7 @@ impl PackWriter {
             body_path,
             object_count: 0,
             path: path.to_path_buf(),
-            seen: HashSet::new(),
+            seen: HashSet::default(),
         })
     }
 
@@ -990,7 +990,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
         return delta;
     }
 
-    let mut index = HashMap::<u32, Vec<usize>>::new();
+    let mut index = HashMap::<u32, Vec<usize>>::default();
     for source_offset in (0..src.len().saturating_sub(block_size - 1)).step_by(block_size) {
         let hash = block_hash(&src[source_offset..source_offset + block_size]);
         index.entry(hash).or_default().push(source_offset);

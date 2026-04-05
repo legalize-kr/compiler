@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 use regex::Regex;
+use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
 
 use crate::git_repo::RepoPathBuf;

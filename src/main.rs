@@ -13,13 +13,13 @@ mod render;
 /// Parses cached XML documents into metadata and article structures.
 mod xml_parser;
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
 
 use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf};
@@ -107,10 +107,10 @@ fn run(cli: Cli) -> Result<()> {
     let history = {
         let history_dir = cache_dir.join("history");
         if !history_dir.is_dir() {
-            HashMap::new()
+            HashMap::default()
         } else {
             let mut files = read_sorted_files(&history_dir, "json")?;
-            let mut amendments = HashMap::new();
+            let mut amendments = HashMap::default();
             for path in files.drain(..) {
                 let bytes = fs::read(&path)
                     .with_context(|| format!("failed to read {}", path.display()))?;
@@ -452,7 +452,7 @@ mod tests {
         write_sample_xml(&detail_dir, "2", SAMPLE_XML_3);
         write_sample_xml(&detail_dir, "63422", SAMPLE_INVALID_HTML);
 
-        let mut history = HashMap::new();
+        let mut history = HashMap::default();
         history.insert(String::from("1"), String::from("제정"));
         history.insert(String::from("2"), String::from("일부개정"));
         history.insert(String::from("10"), String::from("일부개정"));
