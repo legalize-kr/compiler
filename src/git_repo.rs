@@ -275,8 +275,6 @@ impl BareRepoWriter {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
 
-        init_bare_repo(&temp_output)?;
-
         let pack_path = temp_output.join("objects/pack/tmp_pack.pack");
         fs::create_dir_all(
             pack_path
@@ -879,26 +877,6 @@ impl PackWriter {
     }
 }
 
-/// Initializes the temporary bare repository with the standard files ref backend.
-fn init_bare_repo(repo_dir: &Path) -> Result<()> {
-    const MAIN_BRANCH: &str = "main";
-
-    //
-    // This compiler only writes `HEAD` and `refs/heads/main`, so loose ref files are simpler than
-    // carrying reftable compatibility logic or an extra `git update-ref` subprocess.
-    //
-    let output = git_command()
-        .arg("init")
-        .arg("--quiet")
-        .arg("--bare")
-        .arg("--initial-branch")
-        .arg(MAIN_BRANCH)
-        .arg(repo_dir)
-        .output()
-        .with_context(|| format!("failed to init bare repo at {}", repo_dir.display()))?;
-    ensure_command_success(output, "git init --bare")
-}
-
 /// Creates a Git command with user config disabled for deterministic behavior.
 fn git_command() -> Command {
     let mut command = Command::new("git");
@@ -1176,6 +1154,7 @@ fn hex(sha: &[u8; 20]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use tempfile::TempDir;
@@ -1251,6 +1230,41 @@ mod tests {
         assert_eq!(
             git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
             "1"
+        );
+    }
+
+    #[test]
+    fn finished_repo_is_cloneable_without_git_init_scaffolding() {
+        let temp = TempDir::new().unwrap();
+        let clone = temp.path().join("clone");
+        let (output, mut writer) = new_writer(&temp);
+        writer
+            .commit_static(
+                &RepoPathBuf::root_file("README.md"),
+                b"hello\n",
+                "initial commit",
+                1_774_839_600,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert!(!output.join("config").exists());
+        assert!(!output.join("description").exists());
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "1"
+        );
+
+        let clone_output = git_command()
+            .arg("clone")
+            .arg(&output)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        ensure_command_success(clone_output, "git clone").unwrap();
+        assert_eq!(
+            fs::read_to_string(clone.join("README.md")).unwrap(),
+            "hello\n"
         );
     }
 
