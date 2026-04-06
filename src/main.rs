@@ -111,7 +111,7 @@ fn run(cli: Cli) -> Result<()> {
     //
     // Load history-side amendment labels before planning commit order.
     //
-    eprintln!("loading amendment history...");
+    eprintln!("1. Loading amendment history");
     // History JSON overrides the amendment labels embedded in detail XML.
     let history = {
         let history_dir = cache_dir.join("history");
@@ -136,7 +136,7 @@ fn run(cli: Cli) -> Result<()> {
     //
     // Pass 1 only touches metadata so every later full parse follows one stable order.
     //
-    eprintln!("pass 1/2: scanning cache metadata...");
+    eprintln!("2. Scanning cache metadata");
     let entries = {
         let files = read_sorted_files(&detail_dir, "xml")?;
         let parsed = files
@@ -253,7 +253,7 @@ fn run(cli: Cli) -> Result<()> {
     // Seed the synthetic history commits that always come before law revisions.
     //
     eprintln!(
-        "writing {} commits to {}...",
+        "3. Writing {} commits to {}",
         entries.len(),
         cli.output.display()
     );
@@ -327,8 +327,8 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
+    eprintln!("4. Running git index-pack");
     repo.finish()?;
-    eprintln!("done");
     Ok(())
 }
 
