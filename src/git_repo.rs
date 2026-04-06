@@ -580,6 +580,8 @@ impl BareRepoWriter {
 
     /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
+        // NOTE: 32% of commit_file() runtime
+
         //
         // Refresh only the dirty subtree in the steady state. Full group scans are only needed
         // when the `kr/` tree layout itself changed, such as the first time a new group appears.
@@ -795,6 +797,8 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
+        // NOTE: 3.3% of commit_file() runtime
+
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let mut commit = format!("tree {}\n", hex(&tree));
         if let Some(parent) = self.parent_commit {
@@ -845,6 +849,8 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
+        // NOTE: 4.0% of commit_file() runtime
+
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
         }
@@ -1026,7 +1032,10 @@ fn compress(data: &[u8]) -> Vec<u8> {
 }
 
 /// Builds a Git copy/insert delta from `src` to `dst`.
+#[inline(never)]
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    // NOTE: 60% of commit_file() runtime
+
     let block_size = 16usize;
 
     //
