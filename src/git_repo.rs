@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -5,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use libdeflater::{CompressionLvl, Compressor};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use sha1::{Digest, Sha1};
 use smallvec::SmallVec;
@@ -1019,13 +1019,23 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], is_tree: bool) -> (usize, bool)
     }
 }
 
+thread_local! {
+    /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
+    static COMPRESSOR: RefCell<Compressor> =
+        RefCell::new(Compressor::new(CompressionLvl::new(1).unwrap()));
+}
+
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder
-        .write_all(data)
-        .expect("zlib write to Vec cannot fail");
-    encoder.finish().expect("zlib finish on Vec cannot fail")
+    COMPRESSOR.with(|compressor| {
+        let mut compressor = compressor.borrow_mut();
+        let mut output = vec![0; compressor.zlib_compress_bound(data.len())];
+        let compressed = compressor
+            .zlib_compress(data, &mut output)
+            .expect("zlib_compress_bound() must allocate enough space");
+        output.truncate(compressed);
+        output
+    })
 }
 
 /// Fixed block width used by the blob delta matcher.
