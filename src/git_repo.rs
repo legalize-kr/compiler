@@ -1129,37 +1129,42 @@ fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Ve
 fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
     // PACK copy opcodes only encode the non-zero bytes of the offset and size fields.
     let mut command = 0x80;
-    let mut args = Vec::with_capacity(7);
+    let mut args = [0_u8; 7];
+    let mut arg_len = 0usize;
+    let mut push_arg = |byte| {
+        args[arg_len] = byte;
+        arg_len += 1;
+    };
     if offset & 0xff != 0 {
         command |= 0x01;
-        args.push((offset & 0xff) as u8);
+        push_arg((offset & 0xff) as u8);
     }
     if offset & 0xff00 != 0 {
         command |= 0x02;
-        args.push(((offset >> 8) & 0xff) as u8);
+        push_arg(((offset >> 8) & 0xff) as u8);
     }
     if offset & 0xff0000 != 0 {
         command |= 0x04;
-        args.push(((offset >> 16) & 0xff) as u8);
+        push_arg(((offset >> 16) & 0xff) as u8);
     }
     if offset & 0xff000000 != 0 {
         command |= 0x08;
-        args.push(((offset >> 24) & 0xff) as u8);
+        push_arg(((offset >> 24) & 0xff) as u8);
     }
     if size & 0xff != 0 {
         command |= 0x10;
-        args.push((size & 0xff) as u8);
+        push_arg((size & 0xff) as u8);
     }
     if size & 0xff00 != 0 {
         command |= 0x20;
-        args.push(((size >> 8) & 0xff) as u8);
+        push_arg(((size >> 8) & 0xff) as u8);
     }
     if size & 0xff0000 != 0 {
         command |= 0x40;
-        args.push(((size >> 16) & 0xff) as u8);
+        push_arg(((size >> 16) & 0xff) as u8);
     }
     out.push(command);
-    out.extend_from_slice(&args);
+    out.extend_from_slice(&args[..arg_len]);
 }
 
 /// Hashes one fixed-size block for delta index lookup.
