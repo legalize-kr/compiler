@@ -25,8 +25,6 @@ enum PackObjectKind {
     Blob = 3,
     /// Delta payload that references a base by negative offset.
     OfsDelta = 6,
-    /// Delta payload that references a base object id.
-    RefDelta = 7,
 }
 
 impl PackObjectKind {
@@ -36,7 +34,7 @@ impl PackObjectKind {
             Self::Commit => b"commit",
             Self::Tree => b"tree",
             Self::Blob => b"blob",
-            Self::OfsDelta | Self::RefDelta => {
+            Self::OfsDelta => {
                 panic!("delta objects do not have standalone git object headers")
             }
         }
@@ -778,7 +776,8 @@ impl BareRepoWriter {
 
                     let kr_tree_sha =
                         git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
-                    self.writer.write_ofs_delta(base_offset, &delta, kr_tree_sha)?;
+                    self.writer
+                        .write_ofs_delta(base_offset, &delta, kr_tree_sha)?;
                     self.kr.current_sha = Some(kr_tree_sha);
                     self.kr.current_offset = Some(self.writer.offset_of(&kr_tree_sha));
                 } else {
@@ -1021,7 +1020,8 @@ impl PackWriter {
         self.file.write_all(&header_bytes)?;
         self.file.write_all(&ofs_bytes)?;
         self.file.write_all(&compressed)?;
-        self.bytes_written += header_bytes.len() as u64 + ofs_bytes.len() as u64 + compressed.len() as u64;
+        self.bytes_written +=
+            header_bytes.len() as u64 + ofs_bytes.len() as u64 + compressed.len() as u64;
         self.object_count += 1;
         self.idx_entries.push(IdxEntry {
             sha: result_sha,
