@@ -911,11 +911,11 @@ impl BareRepoWriter {
         let mut commit = String::with_capacity(1000);
         let tree_hex = hex_buf(&tree);
         let tree_hex_str = std::str::from_utf8(&tree_hex).unwrap();
-        write!(commit, "tree {tree_hex_str}\n").unwrap();
+        writeln!(commit, "tree {tree_hex_str}").unwrap();
         if let Some(parent) = self.parent_commit {
             let parent_hex = hex_buf(&parent);
             let parent_hex_str = std::str::from_utf8(&parent_hex).unwrap();
-            write!(commit, "parent {parent_hex_str}\n").unwrap();
+            writeln!(commit, "parent {parent_hex_str}").unwrap();
         }
         write!(
             commit,
@@ -1232,7 +1232,7 @@ thread_local! {
     static COMPRESSOR: RefCell<Compressor> =
         RefCell::new(Compressor::new(CompressionLvl::new(1).unwrap()));
     /// Reusable scratch buffer for compression output to avoid per-call allocation.
-    static COMP_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static COMP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Compresses one pack payload with the current fast zlib setting.
