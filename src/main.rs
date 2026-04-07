@@ -327,7 +327,7 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    eprintln!("4. Running git index-pack");
+    eprintln!("4. Finalizing pack + index");
     repo.finish()?;
     Ok(())
 }
