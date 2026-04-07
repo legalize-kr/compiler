@@ -7,7 +7,7 @@ use std::process;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crc32fast::Hasher as Crc32Hasher;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use sha1::{Digest, Sha1};
 use smallvec::SmallVec;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
@@ -23,6 +23,8 @@ enum PackObjectKind {
     Tree = 2,
     /// Full blob object payload.
     Blob = 3,
+    /// Delta payload that references a base by negative offset.
+    OfsDelta = 6,
     /// Delta payload that references a base object id.
     RefDelta = 7,
 }
@@ -34,7 +36,9 @@ impl PackObjectKind {
             Self::Commit => b"commit",
             Self::Tree => b"tree",
             Self::Blob => b"blob",
-            Self::RefDelta => panic!("ref deltas do not have standalone git object headers"),
+            Self::OfsDelta | Self::RefDelta => {
+                panic!("delta objects do not have standalone git object headers")
+            }
         }
     }
 }
@@ -182,6 +186,8 @@ struct Group {
     prev_tree_bytes: Option<Vec<u8>>,
     /// Object id of the previous subtree revision.
     prev_tree_sha: Option<[u8; 20]>,
+    /// Pack byte offset of the previous subtree object (base for OFS_DELTA).
+    prev_tree_offset: Option<u64>,
 }
 
 /// Maximum blob delta chain depth (matches git's default repack limit).
@@ -194,8 +200,10 @@ struct PreviousBlob {
     sha: [u8; 20],
     /// Full blob contents used for delta construction.
     content: Vec<u8>,
-    /// Current delta chain depth (0 = full object, increments per REF_DELTA).
+    /// Current delta chain depth (0 = full object, increments per OFS_DELTA).
     depth: usize,
+    /// Pack byte offset where this blob was written (base for OFS_DELTA).
+    offset: u64,
 }
 
 /// Borrowed blob payload that was already hashed and compressed off the writer hot path.
@@ -230,6 +238,8 @@ struct RootTreeState {
     dirty_entry: Option<DirtyRootEntry>,
     /// Most recently written root tree SHA.
     current_sha: Option<[u8; 20]>,
+    /// Pack byte offset of the most recently written root tree (base for OFS_DELTA).
+    current_offset: Option<u64>,
 }
 
 /// Cached `kr/` subtree bytes plus per-group lookup metadata.
@@ -245,6 +255,8 @@ struct KrTreeState {
     sha_offsets: Vec<usize>,
     /// Most recently written `kr/` tree SHA.
     current_sha: Option<[u8; 20]>,
+    /// Pack byte offset of the most recently written `kr/` tree (base for OFS_DELTA).
+    current_offset: Option<u64>,
     /// Whether group insertion changed the `kr/` tree layout.
     structure_dirty: bool,
     /// Group index whose subtree SHA changed most recently.
@@ -269,8 +281,8 @@ struct PackWriter {
     object_count: u32,
     /// Filesystem path of the `.pack` file being written.
     path: PathBuf,
-    /// Object ids already emitted into the pack stream.
-    seen: HashSet<[u8; 20]>,
+    /// Object ids already emitted, mapped to their byte offset inside the pack.
+    seen: HashMap<[u8; 20], u64>,
     /// Accumulated index entries for `.idx` v2 generation.
     idx_entries: Vec<IdxEntry>,
     /// Running byte offset tracking how many bytes have been written so far.
@@ -524,7 +536,7 @@ impl BareRepoWriter {
                 let delta = create_delta(&previous.content, content);
                 if delta.len() < content.len() * 3 / 4 {
                     self.writer
-                        .write_ref_delta(previous.sha, &delta, blob.sha)?;
+                        .write_ofs_delta(previous.offset, &delta, blob.sha)?;
                     new_depth = previous.depth + 1;
                 } else {
                     self.writer.write_precompressed_object(
@@ -555,6 +567,7 @@ impl BareRepoWriter {
             sha: blob.sha,
             depth: new_depth,
             content: content.to_vec(),
+            offset: self.writer.offset_of(&blob.sha),
         });
 
         //
@@ -586,6 +599,7 @@ impl BareRepoWriter {
                 cached_sha: None,
                 prev_tree_bytes: None,
                 prev_tree_sha: None,
+                prev_tree_offset: None,
             },
         );
         for index in self.kr.group_indices.values_mut() {
@@ -633,12 +647,12 @@ impl BareRepoWriter {
                     tree
                 };
                 let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
-                if let (Some(prev_bytes), Some(prev_sha)) =
-                    (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+                if let (Some(prev_bytes), Some(prev_offset)) =
+                    (group.prev_tree_bytes.as_ref(), group.prev_tree_offset)
                 {
                     let delta = create_delta(prev_bytes, &tree);
                     if delta.len() < tree.len() * 3 / 4 {
-                        self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                        self.writer.write_ofs_delta(prev_offset, &delta, sha)?;
                     } else {
                         self.writer.write_object(PackObjectKind::Tree, &tree)?;
                     }
@@ -647,6 +661,7 @@ impl BareRepoWriter {
                 }
                 group.prev_tree_bytes = Some(tree);
                 group.prev_tree_sha = Some(sha);
+                group.prev_tree_offset = Some(self.writer.offset_of(&sha));
                 group.cached_sha = Some(sha);
             }
         } else if let Some(index) = self.kr.dirty_group_index
@@ -668,12 +683,12 @@ impl BareRepoWriter {
                 tree
             };
             let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
-            if let (Some(prev_bytes), Some(prev_sha)) =
-                (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+            if let (Some(prev_bytes), Some(prev_offset)) =
+                (group.prev_tree_bytes.as_ref(), group.prev_tree_offset)
             {
                 let delta = create_delta(prev_bytes, &tree);
                 if delta.len() < tree.len() * 3 / 4 {
-                    self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                    self.writer.write_ofs_delta(prev_offset, &delta, sha)?;
                 } else {
                     self.writer.write_object(PackObjectKind::Tree, &tree)?;
                 }
@@ -682,6 +697,7 @@ impl BareRepoWriter {
             }
             group.prev_tree_bytes = Some(tree);
             group.prev_tree_sha = Some(sha);
+            group.prev_tree_offset = Some(self.writer.offset_of(&sha));
             group.cached_sha = Some(sha);
         }
 
@@ -714,8 +730,8 @@ impl BareRepoWriter {
                     None
                 };
 
-                let base_sha = self.kr.current_sha;
-                if let (Some(pos), Some(base_sha)) = (new_group_pos, base_sha) {
+                let base_kr_offset = self.kr.current_offset;
+                if let (Some(pos), Some(base_offset)) = (new_group_pos, base_kr_offset) {
                     // In-place splice: construct entry, insert into cache, emit tiny delta
                     let group = &self.kr.groups[pos];
                     let group_sha = group.cached_sha.context("missing cached subtree SHA")?;
@@ -762,8 +778,9 @@ impl BareRepoWriter {
 
                     let kr_tree_sha =
                         git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
-                    self.writer.write_ref_delta(base_sha, &delta, kr_tree_sha)?;
+                    self.writer.write_ofs_delta(base_offset, &delta, kr_tree_sha)?;
                     self.kr.current_sha = Some(kr_tree_sha);
+                    self.kr.current_offset = Some(self.writer.offset_of(&kr_tree_sha));
                 } else {
                     // First time or multiple groups changed: full rebuild
                     self.kr.cache.clear();
@@ -781,12 +798,13 @@ impl BareRepoWriter {
                         .writer
                         .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                     self.kr.current_sha = Some(kr_tree_sha);
+                    self.kr.current_offset = Some(self.writer.offset_of(&kr_tree_sha));
                 }
                 self.kr.structure_dirty = false;
                 self.kr.dirty_group_index = None;
                 self.kr.current_sha
             } else if let Some(index) = self.kr.dirty_group_index.take() {
-                let base_kr_tree_sha = self.kr.current_sha;
+                let base_kr_offset = self.kr.current_offset;
                 let sha_offset = self.kr.sha_offsets[index];
                 let new_group_sha = self.kr.groups[index]
                     .cached_sha
@@ -794,14 +812,15 @@ impl BareRepoWriter {
                 let delta = make_copy_insert_delta(self.kr.cache.len(), sha_offset, &new_group_sha);
                 self.kr.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_group_sha);
                 let kr_tree_sha = git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
-                if let Some(base_kr_tree_sha) = base_kr_tree_sha {
+                if let Some(base_kr_offset) = base_kr_offset {
                     self.writer
-                        .write_ref_delta(base_kr_tree_sha, &delta, kr_tree_sha)?;
+                        .write_ofs_delta(base_kr_offset, &delta, kr_tree_sha)?;
                 } else {
                     self.writer
                         .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                 }
                 self.kr.current_sha = Some(kr_tree_sha);
+                self.kr.current_offset = Some(self.writer.offset_of(&kr_tree_sha));
                 Some(kr_tree_sha)
             } else if let Some(kr_tree_sha) = self.kr.current_sha {
                 Some(kr_tree_sha)
@@ -810,6 +829,7 @@ impl BareRepoWriter {
                     .writer
                     .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                 self.kr.current_sha = Some(kr_tree_sha);
+                self.kr.current_offset = Some(self.writer.offset_of(&kr_tree_sha));
                 Some(kr_tree_sha)
             }
         };
@@ -886,9 +906,9 @@ impl BareRepoWriter {
             let delta = make_copy_insert_delta(self.root.cache.len(), sha_offset, &new_sha);
             self.root.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
             let root_sha = git_hash(PackObjectKind::Tree.git_type_name(), &self.root.cache);
-            if let Some(base_root_sha) = self.root.current_sha {
+            if let Some(base_root_offset) = self.root.current_offset {
                 self.writer
-                    .write_ref_delta(base_root_sha, &delta, root_sha)?;
+                    .write_ofs_delta(base_root_offset, &delta, root_sha)?;
             } else {
                 self.writer
                     .write_object(PackObjectKind::Tree, &self.root.cache)?;
@@ -902,6 +922,7 @@ impl BareRepoWriter {
         };
 
         self.root.current_sha = Some(root_sha);
+        self.root.current_offset = Some(self.writer.offset_of(&root_sha));
         self.tree_dirty = false;
         Ok(root_sha)
     }
@@ -940,6 +961,11 @@ impl BareRepoWriter {
 }
 
 impl PackWriter {
+    /// Returns the pack byte offset where the given object was written.
+    fn offset_of(&self, sha: &[u8; 20]) -> u64 {
+        self.seen[sha]
+    }
+
     /// Creates a new pack writer that writes directly to the final `.pack` file.
     fn new(path: &Path) -> Result<Self> {
         let mut file = BufWriter::with_capacity(4 << 20, File::create(path)?);
@@ -954,7 +980,7 @@ impl PackWriter {
             file,
             object_count: 0,
             path: path.to_path_buf(),
-            seen: HashSet::default(),
+            seen: HashMap::default(),
             idx_entries: Vec::new(),
             bytes_written: 12,
         })
@@ -969,31 +995,33 @@ impl PackWriter {
         self.write_precompressed_object(object_type, data.len(), sha, &compress(data))
     }
 
-    /// Appends one `REF_DELTA` object to the pack unless the result id already exists.
-    fn write_ref_delta(
+    /// Appends one `OFS_DELTA` object to the pack unless the result id already exists.
+    fn write_ofs_delta(
         &mut self,
-        base_sha: [u8; 20],
+        base_offset: u64,
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        if !self.seen.insert(result_sha) {
+        if self.seen.contains_key(&result_sha) {
             return Ok(result_sha);
         }
 
         let offset = self.bytes_written;
-        let header_bytes = encode_pack_entry_header(PackObjectKind::RefDelta, delta.len());
+        self.seen.insert(result_sha, offset);
+        let header_bytes = encode_pack_entry_header(PackObjectKind::OfsDelta, delta.len());
+        let ofs_bytes = encode_ofs_delta_offset(offset - base_offset);
         let compressed = compress(delta);
 
-        // CRC-32 covers the raw pack entry bytes: header + base SHA + compressed delta.
+        // CRC-32 covers the raw pack entry bytes: header + ofs encoding + compressed delta.
         let mut crc = Crc32Hasher::new();
         crc.update(&header_bytes);
-        crc.update(&base_sha);
+        crc.update(&ofs_bytes);
         crc.update(&compressed);
 
         self.file.write_all(&header_bytes)?;
-        self.file.write_all(&base_sha)?;
+        self.file.write_all(&ofs_bytes)?;
         self.file.write_all(&compressed)?;
-        self.bytes_written += header_bytes.len() as u64 + 20 + compressed.len() as u64;
+        self.bytes_written += header_bytes.len() as u64 + ofs_bytes.len() as u64 + compressed.len() as u64;
         self.object_count += 1;
         self.idx_entries.push(IdxEntry {
             sha: result_sha,
@@ -1011,11 +1039,12 @@ impl PackWriter {
         sha: [u8; 20],
         compressed: &[u8],
     ) -> Result<[u8; 20]> {
-        if !self.seen.insert(sha) {
+        if self.seen.contains_key(&sha) {
             return Ok(sha);
         }
 
         let offset = self.bytes_written;
+        self.seen.insert(sha, offset);
         let header_bytes = encode_pack_entry_header(object_type, size);
 
         // CRC-32 covers the raw pack entry bytes: header + compressed payload.
@@ -1169,6 +1198,21 @@ fn encode_pack_entry_header(object_type: PackObjectKind, size: usize) -> SmallVe
         }
         buf.push(byte);
     }
+    buf
+}
+
+/// Encodes the negative offset for an `OFS_DELTA` pack entry (bijective base-128, big-endian).
+#[inline]
+fn encode_ofs_delta_offset(mut offset: u64) -> SmallVec<[u8; 16]> {
+    let mut buf = SmallVec::<[u8; 16]>::new();
+    buf.push((offset & 0x7f) as u8);
+    offset >>= 7;
+    while offset > 0 {
+        offset -= 1;
+        buf.push(0x80 | (offset & 0x7f) as u8);
+        offset >>= 7;
+    }
+    buf.reverse();
     buf
 }
 
