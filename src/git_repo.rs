@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, anyhow, bail};
-use libdeflater::{CompressionLvl, Compressor, Crc};
+use crc32fast::Hasher as Crc32Hasher;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use sha1::{Digest, Sha1};
 use smallvec::SmallVec;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
+use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
 
 /// Supported pack entry kinds emitted by the handcrafted writer.
 #[repr(u8)]
@@ -972,7 +973,7 @@ impl PackWriter {
         let compressed = compress(delta);
 
         // CRC-32 covers the raw pack entry bytes: header + base SHA + compressed delta.
-        let mut crc = Crc::new();
+        let mut crc = Crc32Hasher::new();
         crc.update(&header_bytes);
         crc.update(&base_sha);
         crc.update(&compressed);
@@ -984,7 +985,7 @@ impl PackWriter {
         self.object_count += 1;
         self.idx_entries.push(IdxEntry {
             sha: result_sha,
-            crc32: crc.sum(),
+            crc32: crc.finalize(),
             offset,
         });
         Ok(result_sha)
@@ -1006,7 +1007,7 @@ impl PackWriter {
         let header_bytes = encode_pack_entry_header(object_type, size);
 
         // CRC-32 covers the raw pack entry bytes: header + compressed payload.
-        let mut crc = Crc::new();
+        let mut crc = Crc32Hasher::new();
         crc.update(&header_bytes);
         crc.update(compressed);
 
@@ -1016,7 +1017,7 @@ impl PackWriter {
         self.object_count += 1;
         self.idx_entries.push(IdxEntry {
             sha,
-            crc32: crc.sum(),
+            crc32: crc.finalize(),
             offset,
         });
         Ok(sha)
@@ -1192,26 +1193,18 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], is_tree: bool) -> (usize, bool)
 }
 
 thread_local! {
-    /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
-    static COMPRESSOR: RefCell<Compressor> =
-        RefCell::new(Compressor::new(CompressionLvl::new(1).unwrap()));
     /// Reusable scratch buffer for compression output to avoid per-call allocation.
     static COMP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    COMPRESSOR.with(|comp_cell| {
-        COMP_BUF.with(|buf_cell| {
-            let mut comp = comp_cell.borrow_mut();
-            let mut buf = buf_cell.borrow_mut();
-            let bound = comp.zlib_compress_bound(data.len());
-            buf.resize(bound, 0);
-            let actual = comp
-                .zlib_compress(data, &mut buf)
-                .expect("zlib_compress_bound() must allocate enough space");
-            buf[..actual].to_vec()
-        })
+    COMP_BUF.with(|buf_cell| {
+        let mut buf = buf_cell.borrow_mut();
+        buf.resize(compress_bound(data.len()), 0);
+        let (compressed, rc) = compress_slice(&mut buf, data, DeflateConfig::new(1));
+        assert_eq!(rc, ReturnCode::Ok);
+        compressed.to_vec()
     })
 }
 
