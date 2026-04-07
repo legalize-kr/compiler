@@ -1,12 +1,14 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Output};
+use std::process;
+#[cfg(test)]
+use std::process::{Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
-use libdeflater::{CompressionLvl, Compressor};
+use libdeflater::{CompressionLvl, Compressor, Crc};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use sha1::{Digest, Sha1};
 use smallvec::SmallVec;
@@ -177,6 +179,10 @@ struct Group {
     files: Vec<Entry>,
     /// Most recently materialized subtree SHA.
     cached_sha: Option<[u8; 20]>,
+    /// Previous tree serialization kept as a delta base for repeated subtree updates.
+    prev_tree_bytes: Option<Vec<u8>>,
+    /// Object id of the previous subtree revision.
+    prev_tree_sha: Option<[u8; 20]>,
 }
 
 /// Previous blob revision kept as a possible delta base.
@@ -241,20 +247,30 @@ struct KrTreeState {
     dirty_group_index: Option<usize>,
 }
 
-/// Low-level writer that streams raw packfile entries before final assembly.
+/// One entry in the pack index, accumulated during pack writing.
+struct IdxEntry {
+    /// Object id of the packed object.
+    sha: [u8; 20],
+    /// CRC-32 of the raw pack entry bytes (header + optional base SHA + compressed data).
+    crc32: u32,
+    /// Byte offset of the entry within the pack file.
+    offset: u64,
+}
+
+/// Low-level writer that streams packfile entries directly to the final `.pack` file.
 struct PackWriter {
-    // Object payloads are buffered separately so finish() can stream a final pack
-    // header with the real object count instead of patching bytes in place.
-    /// Temporary body stream containing pack entries without the final header.
-    body_file: BufWriter<File>,
-    /// Filesystem path of the temporary pack body stream.
-    body_path: PathBuf,
-    /// Number of unique objects appended to the pack body.
+    /// Buffered writer for the pack file (header already written).
+    file: BufWriter<File>,
+    /// Number of unique objects appended to the pack stream.
     object_count: u32,
-    /// Final `.pack` destination path inside the temporary bare repo.
+    /// Filesystem path of the `.pack` file being written.
     path: PathBuf,
     /// Object ids already emitted into the pack stream.
     seen: HashSet<[u8; 20]>,
+    /// Accumulated index entries for `.idx` v2 generation.
+    idx_entries: Vec<IdxEntry>,
+    /// Running byte offset tracking how many bytes have been written so far.
+    bytes_written: u64,
 }
 
 /// Writes the generated law history into a fresh bare Git repository.
@@ -405,16 +421,6 @@ impl BareRepoWriter {
     /// Finalizes the pack, writes `main` as loose refs, and moves the temporary repo into place.
     pub fn finish(mut self) -> Result<()> {
         self.writer.finish()?;
-
-        let pack_path = Path::new("objects/pack/tmp_pack.pack");
-        let output = git_command()
-            .arg("-C")
-            .arg(&self.temp_output)
-            .arg("index-pack")
-            .arg(pack_path)
-            .output()
-            .context("failed to run git index-pack")?;
-        ensure_command_success(output, "git index-pack")?;
 
         if let Some(parent_commit) = self.parent_commit {
             let refs_heads = self.temp_output.join("refs/heads");
@@ -567,6 +573,8 @@ impl BareRepoWriter {
                 name: name.to_vec(),
                 files: Vec::new(),
                 cached_sha: None,
+                prev_tree_bytes: None,
+                prev_tree_sha: None,
             },
         );
         for index in self.kr.group_indices.values_mut() {
@@ -613,7 +621,21 @@ impl BareRepoWriter {
                     }
                     tree
                 };
-                let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
+                if let (Some(prev_bytes), Some(prev_sha)) =
+                    (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+                {
+                    let delta = create_delta(prev_bytes, &tree);
+                    if delta.len() < tree.len() * 3 / 4 {
+                        self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                    } else {
+                        self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                    }
+                } else {
+                    self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                }
+                group.prev_tree_bytes = Some(tree);
+                group.prev_tree_sha = Some(sha);
                 group.cached_sha = Some(sha);
             }
         } else if let Some(index) = self.kr.dirty_group_index
@@ -634,7 +656,21 @@ impl BareRepoWriter {
                 }
                 tree
             };
-            let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
+            let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
+            if let (Some(prev_bytes), Some(prev_sha)) =
+                (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+            {
+                let delta = create_delta(prev_bytes, &tree);
+                if delta.len() < tree.len() * 3 / 4 {
+                    self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                } else {
+                    self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                }
+            } else {
+                self.writer.write_object(PackObjectKind::Tree, &tree)?;
+            }
+            group.prev_tree_bytes = Some(tree);
+            group.prev_tree_sha = Some(sha);
             group.cached_sha = Some(sha);
         }
 
@@ -650,24 +686,87 @@ impl BareRepoWriter {
             None
         } else {
             if self.kr.structure_dirty || self.kr.sha_offsets.len() != self.kr.groups.len() {
-                self.kr.cache.clear();
-                self.kr.sha_offsets.clear();
-                for group in &self.kr.groups {
-                    self.kr.cache.extend_from_slice(b"40000 ");
-                    self.kr.cache.extend_from_slice(&group.name);
-                    self.kr.cache.push(0);
-                    self.kr.sha_offsets.push(self.kr.cache.len());
-                    self.kr.cache.extend_from_slice(
-                        &group.cached_sha.context("missing cached subtree SHA")?,
-                    );
+                // Find which group was inserted (groups already has N+1, sha_offsets has N)
+                let old_len = self.kr.sha_offsets.len();
+                let new_group_pos = if self.kr.groups.len() == old_len + 1 {
+                    // Exactly one group was inserted; find it
+                    (0..self.kr.groups.len()).find(|&i| {
+                        i >= old_len || self.kr.sha_offsets.get(i).is_none()
+                            || self.kr.cache.get(self.kr.sha_offsets[i]..self.kr.sha_offsets[i] + 20)
+                                != Some(&self.kr.groups[i].cached_sha.unwrap_or([0; 20]))
+                    })
+                } else {
+                    None
+                };
+
+                let base_sha = self.kr.current_sha;
+                if let (Some(pos), Some(base_sha)) = (new_group_pos, base_sha) {
+                    // In-place splice: construct entry, insert into cache, emit tiny delta
+                    let group = &self.kr.groups[pos];
+                    let group_sha = group.cached_sha.context("missing cached subtree SHA")?;
+                    let mut entry = Vec::with_capacity(6 + group.name.len() + 1 + 20);
+                    entry.extend_from_slice(b"40000 ");
+                    entry.extend_from_slice(&group.name);
+                    entry.push(0);
+                    let sha_off_in_entry = entry.len();
+                    entry.extend_from_slice(&group_sha);
+
+                    let old_cache_len = self.kr.cache.len();
+                    let byte_pos = if pos > 0 && pos <= old_len {
+                        self.kr.sha_offsets[pos - 1] + 20
+                    } else if pos == 0 {
+                        0
+                    } else {
+                        old_cache_len
+                    };
+
+                    // Build delta BEFORE modifying cache
+                    let mut delta = Vec::with_capacity(64 + entry.len());
+                    encode_varint(&mut delta, old_cache_len);
+                    encode_varint(&mut delta, old_cache_len + entry.len());
+                    if byte_pos > 0 {
+                        emit_copy(&mut delta, 0, byte_pos);
+                    }
+                    emit_inserts(&mut delta, &entry);
+                    let tail = old_cache_len - byte_pos;
+                    if tail > 0 {
+                        emit_copy(&mut delta, byte_pos, tail);
+                    }
+
+                    // Splice entry into cache
+                    self.kr.cache.splice(byte_pos..byte_pos, entry.iter().copied());
+
+                    // Update sha_offsets
+                    let entry_len = entry.len();
+                    for off in self.kr.sha_offsets.iter_mut().skip(pos) {
+                        *off += entry_len;
+                    }
+                    self.kr.sha_offsets.insert(pos, byte_pos + sha_off_in_entry);
+
+                    let kr_tree_sha =
+                        git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
+                    self.writer.write_ref_delta(base_sha, &delta, kr_tree_sha)?;
+                    self.kr.current_sha = Some(kr_tree_sha);
+                } else {
+                    // First time or multiple groups changed: full rebuild
+                    self.kr.cache.clear();
+                    self.kr.sha_offsets.clear();
+                    for group in &self.kr.groups {
+                        self.kr.cache.extend_from_slice(b"40000 ");
+                        self.kr.cache.extend_from_slice(&group.name);
+                        self.kr.cache.push(0);
+                        self.kr.sha_offsets.push(self.kr.cache.len());
+                        self.kr.cache.extend_from_slice(
+                            &group.cached_sha.context("missing cached subtree SHA")?,
+                        );
+                    }
+                    let kr_tree_sha = self.writer
+                        .write_object(PackObjectKind::Tree, &self.kr.cache)?;
+                    self.kr.current_sha = Some(kr_tree_sha);
                 }
                 self.kr.structure_dirty = false;
-                let kr_tree_sha = self
-                    .writer
-                    .write_object(PackObjectKind::Tree, &self.kr.cache)?;
-                self.kr.current_sha = Some(kr_tree_sha);
                 self.kr.dirty_group_index = None;
-                Some(kr_tree_sha)
+                self.kr.current_sha
             } else if let Some(index) = self.kr.dirty_group_index.take() {
                 let base_kr_tree_sha = self.kr.current_sha;
                 let sha_offset = self.kr.sha_offsets[index];
@@ -801,31 +900,45 @@ impl BareRepoWriter {
         // NOTE: 5.0% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
+        use std::fmt::Write as _;
         let mut commit = String::with_capacity(1000);
-        commit.push_str(&format!("tree {}\n", hex(&tree)));
+        let tree_hex = hex_buf(&tree);
+        let tree_hex_str = std::str::from_utf8(&tree_hex).unwrap();
+        write!(commit, "tree {tree_hex_str}\n").unwrap();
         if let Some(parent) = self.parent_commit {
-            commit.push_str(&format!("parent {}\n", hex(&parent)));
+            let parent_hex = hex_buf(&parent);
+            let parent_hex_str = std::str::from_utf8(&parent_hex).unwrap();
+            write!(commit, "parent {parent_hex_str}\n").unwrap();
         }
-        commit.push_str(&format!(
+        write!(
+            commit,
             "author {} <{}> {} +0900\ncommitter {} <{}> {} +0900\n\n{message}",
             author.name, author.email, time.epoch, committer.name, committer.email, time.epoch
-        ));
+        )
+        .unwrap();
         self.writer
             .write_object(PackObjectKind::Commit, commit.as_bytes())
     }
 }
 
 impl PackWriter {
-    /// Creates a new pack writer that buffers entry bodies in a temporary file.
+    /// Creates a new pack writer that writes directly to the final `.pack` file.
     fn new(path: &Path) -> Result<Self> {
-        let body_path = path.with_extension("pack.body");
-        let body_file = BufWriter::with_capacity(1 << 20, File::create(&body_path)?);
+        let mut file = BufWriter::with_capacity(4 << 20, File::create(path)?);
+        // Write PACK header with placeholder object count (patched in finish()).
+        let pack_header: [u8; 12] = [
+            b'P', b'A', b'C', b'K', // magic
+            0, 0, 0, 2, // version 2
+            0, 0, 0, 0, // object count placeholder
+        ];
+        file.write_all(&pack_header)?;
         Ok(Self {
-            body_file,
-            body_path,
+            file,
             object_count: 0,
             path: path.to_path_buf(),
             seen: HashSet::default(),
+            idx_entries: Vec::new(),
+            bytes_written: 12,
         })
     }
 
@@ -845,18 +958,30 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 12.1% = 5.1% (from root_tree_sha()) + 7.0% (from commit_file() directly) of
-        // commit_file() runtime
-
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
         }
 
-        // REF_DELTA stores the base object id before the compressed delta payload.
-        self.write_pack_entry_header(PackObjectKind::RefDelta, delta.len())?;
-        self.write_raw(&base_sha)?;
-        self.write_raw(&compress(delta))?;
+        let offset = self.bytes_written;
+        let header_bytes = encode_pack_entry_header(PackObjectKind::RefDelta, delta.len());
+        let compressed = compress(delta);
+
+        // CRC-32 covers the raw pack entry bytes: header + base SHA + compressed delta.
+        let mut crc = Crc::new();
+        crc.update(&header_bytes);
+        crc.update(&base_sha);
+        crc.update(&compressed);
+
+        self.file.write_all(&header_bytes)?;
+        self.file.write_all(&base_sha)?;
+        self.file.write_all(&compressed)?;
+        self.bytes_written += header_bytes.len() as u64 + 20 + compressed.len() as u64;
         self.object_count += 1;
+        self.idx_entries.push(IdxEntry {
+            sha: result_sha,
+            crc32: crc.sum(),
+            offset,
+        });
         Ok(result_sha)
     }
 
@@ -872,90 +997,165 @@ impl PackWriter {
             return Ok(sha);
         }
 
-        //
-        // PACK object headers use a variable-length size encoding ahead of the compressed body.
-        //
-        self.write_pack_entry_header(object_type, size)?;
-        self.write_raw(compressed)?;
+        let offset = self.bytes_written;
+        let header_bytes = encode_pack_entry_header(object_type, size);
+
+        // CRC-32 covers the raw pack entry bytes: header + compressed payload.
+        let mut crc = Crc::new();
+        crc.update(&header_bytes);
+        crc.update(compressed);
+
+        self.file.write_all(&header_bytes)?;
+        self.file.write_all(compressed)?;
+        self.bytes_written += header_bytes.len() as u64 + compressed.len() as u64;
         self.object_count += 1;
+        self.idx_entries.push(IdxEntry {
+            sha,
+            crc32: crc.sum(),
+            offset,
+        });
         Ok(sha)
     }
 
-    /// Writes the final pack header and trailer checksum around the buffered body stream.
+    /// Finalizes the pack file (patches object count, appends checksum) and generates the `.idx`.
     fn finish(&mut self) -> Result<()> {
-        //
-        // Assemble the final pack in one streamed pass so finish() does not reread the whole file.
-        //
-        self.body_file.flush()?;
+        self.file.flush()?;
 
-        let mut output = BufWriter::with_capacity(1 << 20, File::create(&self.path)?);
+        // Patch the real object count at offset 8.
+        let inner = self.file.get_mut();
+        inner.seek(SeekFrom::Start(8))?;
+        inner.write_all(&self.object_count.to_be_bytes())?;
+        inner.flush()?;
+
+        // Re-read entire file through SHA-1 hasher (streaming, 1MB chunks).
+        let mut reader = BufReader::with_capacity(4 << 20, File::open(&self.path)?);
         let mut hasher = Sha1::new();
-
-        let pack_header = [
-            b'P',
-            b'A',
-            b'C',
-            b'K',
-            0,
-            0,
-            0,
-            2,
-            (self.object_count >> 24) as u8,
-            (self.object_count >> 16) as u8,
-            (self.object_count >> 8) as u8,
-            self.object_count as u8,
-        ];
-        output.write_all(&pack_header)?;
-        hasher.update(pack_header);
-
-        let mut body = BufReader::with_capacity(1 << 20, File::open(&self.body_path)?);
-        let mut buffer = [0_u8; 1 << 20];
+        let mut buffer = [0u8; 1 << 20];
         loop {
-            let read = body.read(&mut buffer)?;
-            if read == 0 {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
                 break;
             }
-            let chunk = &buffer[..read];
-            output.write_all(chunk)?;
-            hasher.update(chunk);
+            hasher.update(&buffer[..n]);
         }
+        drop(reader);
+        let pack_checksum: [u8; 20] = hasher.finalize().into();
 
-        let checksum: [u8; 20] = hasher.finalize().into();
-        output.write_all(&checksum)?;
-        output.flush()?;
-        fs::remove_file(&self.body_path)
-            .with_context(|| format!("failed to remove {}", self.body_path.display()))?;
+        // Append the 20-byte SHA-1 checksum to the pack file.
+        let mut pack_file = fs::OpenOptions::new().append(true).open(&self.path)?;
+        pack_file.write_all(&pack_checksum)?;
+        pack_file.flush()?;
+        drop(pack_file);
+
+        // Generate .idx v2 file.
+        self.write_idx_v2(&pack_checksum)?;
+
+        // Rename tmp_pack.pack -> pack-{checksum_hex}.pack (and .idx similarly).
+        let checksum_hex = hex(&pack_checksum);
+        let pack_dir = self.path.parent().context("pack path has no parent")?;
+        let final_pack = pack_dir.join(format!("pack-{checksum_hex}.pack"));
+        let final_idx = pack_dir.join(format!("pack-{checksum_hex}.idx"));
+        let tmp_idx = self.path.with_extension("idx");
+        fs::rename(&self.path, &final_pack)?;
+        fs::rename(&tmp_idx, &final_idx)?;
         Ok(())
     }
 
-    /// Writes raw bytes into the temporary pack body stream.
-    fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
-        self.body_file.write_all(bytes)?;
-        Ok(())
-    }
+    /// Writes the `.idx` v2 index file alongside the pack.
+    fn write_idx_v2(&mut self, pack_checksum: &[u8; 20]) -> Result<()> {
+        // Sort index entries by SHA.
+        self.idx_entries.sort_unstable_by(|a, b| a.sha.cmp(&b.sha));
 
-    #[inline]
-    /// Encodes the variable-length PACK entry header for one object payload.
-    fn write_pack_entry_header(&mut self, object_type: PackObjectKind, size: usize) -> Result<()> {
-        let mut header = ((object_type as u8 & 0b111) << 4) | (size as u8 & 0x0f);
-        let mut remaining = size >> 4;
-        if remaining > 0 {
-            header |= 0x80;
+        let idx_path = self.path.with_extension("idx");
+        let mut f = BufWriter::with_capacity(4 << 20, File::create(&idx_path)?);
+        let mut hasher = Sha1::new();
+
+        // Helper: write bytes to both file and hasher.
+        let mut write = |data: &[u8]| -> Result<()> {
+            f.write_all(data)?;
+            hasher.update(data);
+            Ok(())
+        };
+
+        // Magic + version.
+        write(&[0xff, 0x74, 0x4f, 0x63])?;
+        write(&[0x00, 0x00, 0x00, 0x02])?;
+
+        // Fanout table: 256 entries, each a cumulative count of objects whose first SHA byte <= i.
+        let mut fanout = [0u32; 256];
+        for entry in &self.idx_entries {
+            fanout[entry.sha[0] as usize] += 1;
         }
-        self.write_raw(&[header])?;
-        while remaining > 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining > 0 {
-                byte |= 0x80;
+        for i in 1..256 {
+            fanout[i] += fanout[i - 1];
+        }
+        for count in &fanout {
+            write(&count.to_be_bytes())?;
+        }
+
+        // SHA table: n * 20 bytes, sorted.
+        for entry in &self.idx_entries {
+            write(&entry.sha)?;
+        }
+
+        // CRC32 table: n * 4 bytes BE.
+        for entry in &self.idx_entries {
+            write(&entry.crc32.to_be_bytes())?;
+        }
+
+        // Offset table: n * 4 bytes BE. Set bit 31 for offsets >= 2GB.
+        let mut large_offsets = Vec::new();
+        for entry in &self.idx_entries {
+            if entry.offset >= 0x8000_0000 {
+                let large_idx = large_offsets.len() as u32;
+                write(&(large_idx | 0x8000_0000).to_be_bytes())?;
+                large_offsets.push(entry.offset);
+            } else {
+                write(&(entry.offset as u32).to_be_bytes())?;
             }
-            self.write_raw(&[byte])?;
         }
+
+        // Optional 64-bit offset table for large offsets.
+        for &off in &large_offsets {
+            write(&off.to_be_bytes())?;
+        }
+
+        // Pack checksum.
+        write(pack_checksum)?;
+
+        // Flush the hasher through the closure, then compute idx checksum.
+        f.flush()?;
+        let idx_checksum: [u8; 20] = hasher.finalize().into();
+        f.write_all(&idx_checksum)?;
+        f.flush()?;
+
         Ok(())
     }
 }
 
+/// Encodes the variable-length PACK entry header into a stack buffer and returns it.
+#[inline]
+fn encode_pack_entry_header(object_type: PackObjectKind, size: usize) -> SmallVec<[u8; 16]> {
+    let mut buf = SmallVec::new();
+    let mut header = ((object_type as u8 & 0b111) << 4) | (size as u8 & 0x0f);
+    let mut remaining = size >> 4;
+    if remaining > 0 {
+        header |= 0x80;
+    }
+    buf.push(header);
+    while remaining > 0 {
+        let mut byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining > 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+    }
+    buf
+}
+
 /// Creates a Git command with user config disabled for deterministic behavior.
+#[cfg(test)]
 fn git_command() -> Command {
     let mut command = Command::new("git");
     command.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -966,6 +1166,7 @@ fn git_command() -> Command {
 }
 
 /// Converts a failed Git subprocess result into a rich error.
+#[cfg(test)]
 fn ensure_command_success(output: Output, context: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
@@ -1023,18 +1224,23 @@ thread_local! {
     /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
     static COMPRESSOR: RefCell<Compressor> =
         RefCell::new(Compressor::new(CompressionLvl::new(1).unwrap()));
+    /// Reusable scratch buffer for compression output to avoid per-call allocation.
+    static COMP_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    COMPRESSOR.with(|compressor| {
-        let mut compressor = compressor.borrow_mut();
-        let mut output = vec![0; compressor.zlib_compress_bound(data.len())];
-        let compressed = compressor
-            .zlib_compress(data, &mut output)
-            .expect("zlib_compress_bound() must allocate enough space");
-        output.truncate(compressed);
-        output
+    COMPRESSOR.with(|comp_cell| {
+        COMP_BUF.with(|buf_cell| {
+            let mut comp = comp_cell.borrow_mut();
+            let mut buf = buf_cell.borrow_mut();
+            let bound = comp.zlib_compress_bound(data.len());
+            buf.resize(bound, 0);
+            let actual = comp
+                .zlib_compress(data, &mut buf)
+                .expect("zlib_compress_bound() must allocate enough space");
+            buf[..actual].to_vec()
+        })
     })
 }
 
@@ -1265,14 +1471,21 @@ fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     hasher.finalize().into()
 }
 
-/// Hex-encodes one object id for commit bodies and Git subprocess arguments.
-fn hex(sha: &[u8; 20]) -> String {
-    let mut encoded = String::with_capacity(40);
-    for byte in sha {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("formatting into String cannot fail");
+/// Stack-based hex encoding for the commit write hot path (no heap allocation).
+fn hex_buf(sha: &[u8; 20]) -> [u8; 40] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 40];
+    for (i, &b) in sha.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0xf) as usize];
     }
-    encoded
+    buf
+}
+
+/// Hex-encodes one object id for refs, logging, and non-hot-path usage.
+fn hex(sha: &[u8; 20]) -> String {
+    let buf = hex_buf(sha);
+    String::from_utf8(buf.to_vec()).expect("hex digits are valid UTF-8")
 }
 
 #[cfg(test)]
