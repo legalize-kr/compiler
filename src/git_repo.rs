@@ -1259,9 +1259,9 @@ thread_local! {
 
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    #[cfg(feature = "default")]
-    return COMPRESSOR.with(|comp_cell| {
-        COMP_BUF.with(|buf_cell| {
+    COMP_BUF.with(|buf_cell| {
+        #[cfg(feature = "default")]
+        return COMPRESSOR.with(|comp_cell| {
             let mut comp = comp_cell.borrow_mut();
             let mut buf = buf_cell.borrow_mut();
             let bound = comp.zlib_compress_bound(data.len());
@@ -1270,19 +1270,19 @@ fn compress(data: &[u8]) -> Vec<u8> {
                 .zlib_compress(data, &mut buf)
                 .expect("zlib_compress_bound() must allocate enough space");
             buf[..actual].to_vec()
-        })
-    });
+        });
 
-    #[cfg(not(feature = "default"))]
-    return COMP_BUF.with(|buf_cell| {
-        use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
+        #[cfg(not(feature = "default"))]
+        {
+            use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
 
-        let mut buf = buf_cell.borrow_mut();
-        buf.resize(compress_bound(data.len()), 0);
-        let (compressed, rc) = compress_slice(&mut buf, data, DeflateConfig::new(1));
-        assert_eq!(rc, ReturnCode::Ok);
-        compressed.to_vec()
-    });
+            let mut buf = buf_cell.borrow_mut();
+            buf.resize(compress_bound(data.len()), 0);
+            let (compressed, rc) = compress_slice(&mut buf, data, DeflateConfig::new(1));
+            assert_eq!(rc, ReturnCode::Ok);
+            compressed.to_vec()
+        }
+    })
 }
 
 /// Fixed block width used by the blob delta matcher.
