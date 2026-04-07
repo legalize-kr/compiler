@@ -691,8 +691,12 @@ impl BareRepoWriter {
                 let new_group_pos = if self.kr.groups.len() == old_len + 1 {
                     // Exactly one group was inserted; find it
                     (0..self.kr.groups.len()).find(|&i| {
-                        i >= old_len || self.kr.sha_offsets.get(i).is_none()
-                            || self.kr.cache.get(self.kr.sha_offsets[i]..self.kr.sha_offsets[i] + 20)
+                        i >= old_len
+                            || self.kr.sha_offsets.get(i).is_none()
+                            || self
+                                .kr
+                                .cache
+                                .get(self.kr.sha_offsets[i]..self.kr.sha_offsets[i] + 20)
                                 != Some(&self.kr.groups[i].cached_sha.unwrap_or([0; 20]))
                     })
                 } else {
@@ -734,7 +738,9 @@ impl BareRepoWriter {
                     }
 
                     // Splice entry into cache
-                    self.kr.cache.splice(byte_pos..byte_pos, entry.iter().copied());
+                    self.kr
+                        .cache
+                        .splice(byte_pos..byte_pos, entry.iter().copied());
 
                     // Update sha_offsets
                     let entry_len = entry.len();
@@ -760,7 +766,8 @@ impl BareRepoWriter {
                             &group.cached_sha.context("missing cached subtree SHA")?,
                         );
                     }
-                    let kr_tree_sha = self.writer
+                    let kr_tree_sha = self
+                        .writer
                         .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                     self.kr.current_sha = Some(kr_tree_sha);
                 }
