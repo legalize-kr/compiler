@@ -1217,18 +1217,23 @@ thread_local! {
     /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
     static COMPRESSOR: RefCell<Compressor> =
         RefCell::new(Compressor::new(CompressionLvl::new(1).unwrap()));
+    /// Reusable scratch buffer for compression output to avoid per-call allocation.
+    static COMP_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    COMPRESSOR.with(|compressor| {
-        let mut compressor = compressor.borrow_mut();
-        let mut output = vec![0; compressor.zlib_compress_bound(data.len())];
-        let compressed = compressor
-            .zlib_compress(data, &mut output)
-            .expect("zlib_compress_bound() must allocate enough space");
-        output.truncate(compressed);
-        output
+    COMPRESSOR.with(|comp_cell| {
+        COMP_BUF.with(|buf_cell| {
+            let mut comp = comp_cell.borrow_mut();
+            let mut buf = buf_cell.borrow_mut();
+            let bound = comp.zlib_compress_bound(data.len());
+            buf.resize(bound, 0);
+            let actual = comp
+                .zlib_compress(data, &mut buf)
+                .expect("zlib_compress_bound() must allocate enough space");
+            buf[..actual].to_vec()
+        })
     })
 }
 
