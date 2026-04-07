@@ -64,25 +64,39 @@ cargo fmt
 
 # lint
 cargo clippy
-```
 
-## 프로파일링
-`profiling` profile은 `release` 최적화를 유지하면서 debug symbols를 포함합니다.
-
-```bash
+# profiling
 cargo build --profile profiling
-samply record -- ./target/profiling/legalize-kr-compiler ../.cache
+samply record -- target/profiling/legalize-kr-compiler .cache
 ```
 
-## Cross-compiler on macOS
+### How to cross-compile
+On macOS:
 ```bash
 # Install musl toolchain
 brew install filosottile/musl-cross/musl-cross
 
-# Build against x86_64
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin
+
 cargo build -r --target x86_64-unknown-linux-musl
-# Build against aarch64
 cargo build -r --target aarch64-unknown-linux-musl
+cargo build -r --target aarch64-apple-darwin
+cargo build -r --target x86_64-apple-darwin
+
+mkdir -p target/universal2-apple-darwin/release
+lipo -create -output target/{universal2,aarch64,x86_64}-apple-darwin/release/legalize-kr-compiler
+```
+
+On Linux:
+```bash
+# Install zig, rustup, and cargo-zigbuild
+# using the method appropriate for your Linux distribution.
+
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin
+
+cargo zigbuild --no-default-features -r --target x86_64-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target aarch64-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target universal2-apple-darwin
 ```
 
 &nbsp;
