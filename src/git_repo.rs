@@ -11,7 +11,6 @@ use rustc_hash::FxHashMap as HashMap;
 use sha1::{Digest, Sha1};
 use smallvec::SmallVec;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
-use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
 
 /// Supported pack entry kinds emitted by the handcrafted writer.
 #[repr(u8)]
@@ -1251,17 +1250,39 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], is_tree: bool) -> (usize, bool)
 thread_local! {
     /// Reusable scratch buffer for compression output to avoid per-call allocation.
     static COMP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+
+    /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
+    #[cfg(feature = "default")]
+    static COMPRESSOR: RefCell<libdeflater::Compressor> =
+        RefCell::new(libdeflater::Compressor::new(libdeflater::CompressionLvl::new(1).unwrap()));
 }
 
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
-    COMP_BUF.with(|buf_cell| {
+    #[cfg(feature = "default")]
+    return COMPRESSOR.with(|comp_cell| {
+        COMP_BUF.with(|buf_cell| {
+            let mut comp = comp_cell.borrow_mut();
+            let mut buf = buf_cell.borrow_mut();
+            let bound = comp.zlib_compress_bound(data.len());
+            buf.resize(bound, 0);
+            let actual = comp
+                .zlib_compress(data, &mut buf)
+                .expect("zlib_compress_bound() must allocate enough space");
+            buf[..actual].to_vec()
+        })
+    });
+
+    #[cfg(not(feature = "default"))]
+    return COMP_BUF.with(|buf_cell| {
+        use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
+
         let mut buf = buf_cell.borrow_mut();
         buf.resize(compress_bound(data.len()), 0);
         let (compressed, rc) = compress_slice(&mut buf, data, DeflateConfig::new(1));
         assert_eq!(rc, ReturnCode::Ok);
         compressed.to_vec()
-    })
+    });
 }
 
 /// Fixed block width used by the blob delta matcher.
