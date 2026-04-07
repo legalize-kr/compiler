@@ -184,6 +184,9 @@ struct Group {
     prev_tree_sha: Option<[u8; 20]>,
 }
 
+/// Maximum blob delta chain depth (matches git's default repack limit).
+const MAX_DELTA_DEPTH: usize = 50;
+
 /// Previous blob revision kept as a possible delta base.
 #[derive(Debug, Clone)]
 struct PreviousBlob {
@@ -191,6 +194,8 @@ struct PreviousBlob {
     sha: [u8; 20],
     /// Full blob contents used for delta construction.
     content: Vec<u8>,
+    /// Current delta chain depth (0 = full object, increments per REF_DELTA).
+    depth: usize,
 }
 
 /// Borrowed blob payload that was already hashed and compressed off the writer hot path.
@@ -497,6 +502,7 @@ impl BareRepoWriter {
         //
         // Store the file body first, preferably as a delta against the previous revision.
         //
+        let mut new_depth = 0usize;
         if let Some(previous) = entry.previous_blob.as_ref() {
             let previous_len = previous.content.len();
             let current_len = content.len();
@@ -510,11 +516,16 @@ impl BareRepoWriter {
             // Skip expensive delta construction for cases that almost never compress well:
             // identical blobs, very small bodies, or revisions whose sizes diverged too much.
             //
-            if previous.sha != blob.sha && smaller >= 128 && larger <= smaller.saturating_mul(2) {
+            if previous.sha != blob.sha
+                && smaller >= 128
+                && larger <= smaller.saturating_mul(2)
+                && previous.depth < MAX_DELTA_DEPTH
+            {
                 let delta = create_delta(&previous.content, content);
                 if delta.len() < content.len() * 3 / 4 {
                     self.writer
                         .write_ref_delta(previous.sha, &delta, blob.sha)?;
+                    new_depth = previous.depth + 1;
                 } else {
                     self.writer.write_precompressed_object(
                         PackObjectKind::Blob,
@@ -542,6 +553,7 @@ impl BareRepoWriter {
         entry.sha = blob.sha;
         entry.previous_blob = Some(PreviousBlob {
             sha: blob.sha,
+            depth: new_depth,
             content: content.to_vec(),
         });
 
