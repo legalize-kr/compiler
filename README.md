@@ -74,6 +74,17 @@ cargo build --profile profiling
 samply record -- ./target/profiling/legalize-kr-compiler ../.cache
 ```
 
+## Cross-compiler on macOS
+```bash
+# Install musl toolchain
+brew install filosottile/musl-cross/musl-cross
+
+# Build against x86_64
+cargo build -r --target x86_64-unknown-linux-musl
+# Build against aarch64
+cargo build -r --target aarch64-unknown-linux-musl
+```
+
 &nbsp;
 
 ---
