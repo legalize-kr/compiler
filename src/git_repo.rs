@@ -4,8 +4,6 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-#[cfg(test)]
-use std::process::{Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
 use libdeflater::{CompressionLvl, Compressor, Crc};
@@ -1161,40 +1159,6 @@ fn encode_pack_entry_header(object_type: PackObjectKind, size: usize) -> SmallVe
     buf
 }
 
-/// Creates a Git command with user config disabled for deterministic behavior.
-#[cfg(test)]
-fn git_command() -> Command {
-    let mut command = Command::new("git");
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    command.env("GIT_CONFIG_NOSYSTEM", "1");
-    command.env_remove("GIT_DIR");
-    command.env_remove("GIT_WORK_TREE");
-    command
-}
-
-/// Converts a failed Git subprocess result into a rich error.
-#[cfg(test)]
-fn ensure_command_success(output: Output, context: &str) -> Result<()> {
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    bail!(
-        "{context}: exit status {}{}{}",
-        output.status,
-        if stderr.is_empty() { "" } else { "\nstderr:\n" },
-        if stderr.is_empty() {
-            String::new()
-        } else if stdout.is_empty() {
-            stderr
-        } else {
-            format!("{stderr}\nstdout:\n{stdout}")
-        }
-    )
-}
-
 /// Deletes a file or directory tree at `path`.
 fn remove_path(path: &Path) -> Result<()> {
     let metadata =
@@ -1499,10 +1463,43 @@ fn hex(sha: &[u8; 20]) -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::process::{Command, Output};
 
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Creates a Git command with user config disabled for deterministic behavior.
+    fn git_command() -> Command {
+        let mut command = Command::new("git");
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env_remove("GIT_DIR");
+        command.env_remove("GIT_WORK_TREE");
+        command
+    }
+
+    /// Converts a failed Git subprocess result into a rich error.
+    fn ensure_command_success(output: Output, context: &str) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        bail!(
+            "{context}: exit status {}{}{}",
+            output.status,
+            if stderr.is_empty() { "" } else { "\nstderr:\n" },
+            if stderr.is_empty() {
+                String::new()
+            } else if stdout.is_empty() {
+                stderr
+            } else {
+                format!("{stderr}\nstdout:\n{stdout}")
+            }
+        )
+    }
 
     fn output_repo(temp: &TempDir) -> PathBuf {
         temp.path().join("output.git")
