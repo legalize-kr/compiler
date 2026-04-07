@@ -36,8 +36,8 @@ struct PreparedMetadata {
     commit_field: String,
 }
 
-#[derive(Debug, Default)]
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
+#[derive(Debug, Default)]
 pub struct PathRegistry {
     /// Already assigned paths keyed by the final repository path.
     assigned: HashMap<RepoPathBuf, (String, String)>,

@@ -3,8 +3,8 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
-#[derive(Debug, Clone, Default)]
 /// Metadata extracted from one 법령 XML document.
+#[derive(Debug, Clone, Default)]
 pub struct LawMetadata {
     /// 법령일련번호 (MST).
     pub mst: String,
@@ -30,8 +30,8 @@ pub struct LawMetadata {
     pub field: String,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Lowest-level numbered item inside a subparagraph.
+#[derive(Debug, Clone, Default)]
 pub struct Item {
     /// Display number such as `가.`.
     pub number: String,
@@ -39,8 +39,8 @@ pub struct Item {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Numbered subdivision inside a paragraph.
+#[derive(Debug, Clone, Default)]
 pub struct Subparagraph {
     /// Display number such as `1.`.
     pub number: String,
@@ -50,8 +50,8 @@ pub struct Subparagraph {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Paragraph within an article.
+#[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     /// Display number such as `①`.
     pub number: String,
@@ -61,8 +61,8 @@ pub struct Paragraph {
     pub subparagraphs: Vec<Subparagraph>,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Article in the main body of a law.
+#[derive(Debug, Clone, Default)]
 pub struct Article {
     /// Article number without the `조` suffix.
     pub number: String,
@@ -74,15 +74,15 @@ pub struct Article {
     pub paragraphs: Vec<Paragraph>,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Addendum block from a law document.
+#[derive(Debug, Clone, Default)]
 pub struct Addendum {
     /// Rendered addendum text.
     pub content: String,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Fully parsed law document ready for Markdown rendering.
+#[derive(Debug, Clone, Default)]
 pub struct LawDetail {
     /// Top-level metadata used for file naming and frontmatter.
     pub metadata: LawMetadata,
@@ -92,8 +92,8 @@ pub struct LawDetail {
     pub addenda: Vec<Addendum>,
 }
 
-#[derive(Debug, Clone, Default)]
 /// Pass-2 article and addendum body extracted from a law XML document.
+#[derive(Debug, Clone, Default)]
 pub struct LawBody {
     /// Parsed article list.
     pub articles: Vec<Article>,
