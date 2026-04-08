@@ -92,10 +92,32 @@ On Linux:
 # Install zig, rustup, and cargo-zigbuild
 # using the method appropriate for your Linux distribution.
 
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin
+rustup target add \
+  x86_64-unknown-linux-musl \
+  aarch64-unknown-linux-musl \
+  arm-unknown-linux-musleabi \
+  arm-unknown-linux-musleabihf \
+  armv7-unknown-linux-musleabi \
+  armv7-unknown-linux-musleabihf \
+  i586-unknown-linux-musl \
+  i686-unknown-linux-musl \
+  loongarch64-unknown-linux-musl \
+  powerpc64le-unknown-linux-musl \
+  riscv64gc-unknown-linux-musl \
+  x86_64-apple-darwin \
+  aarch64-apple-darwin
 
 cargo zigbuild --no-default-features -r --target x86_64-unknown-linux-musl
 cargo zigbuild --no-default-features -r --target aarch64-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target arm-unknown-linux-musleabi
+cargo zigbuild --no-default-features -r --target arm-unknown-linux-musleabihf
+cargo zigbuild --no-default-features -r --target armv7-unknown-linux-musleabi
+cargo zigbuild --no-default-features -r --target armv7-unknown-linux-musleabihf
+cargo zigbuild --no-default-features -r --target i586-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target i686-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target loongarch64-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target powerpc64le-unknown-linux-musl
+cargo zigbuild --no-default-features -r --target riscv64gc-unknown-linux-musl
 cargo zigbuild --no-default-features -r --target universal2-apple-darwin
 ```
 
