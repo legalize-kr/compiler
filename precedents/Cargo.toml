@@ -1,0 +1,31 @@
+[package]
+name = "precedent-kr-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.5.0"
+quick-xml = "0.38"
+rayon = "1.10"
+regex = "1.11"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+sha1 = "0.10"
+smallvec = "1.15.1"
+time = "0.3"
+zlib-rs = "0.6.3"
+mimalloc = { version = "0.1.48", optional = true }
+libdeflater = { version = "1.25.2", optional = true }
+
+[features]
+default = ["dep:mimalloc", "dep:libdeflater"]
+
+[dev-dependencies]
+tempfile = "3.18"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

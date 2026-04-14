@@ -1,0 +1,1655 @@
+//! Writes the output bare repository and handcrafted packfile stream.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+
+use anyhow::{Context, Result, anyhow, bail};
+use crc32fast::Hasher as Crc32Hasher;
+use rustc_hash::FxHashMap as HashMap;
+use sha1::{Digest, Sha1};
+use smallvec::SmallVec;
+use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
+
+/// Supported pack entry kinds emitted by the handcrafted writer.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackObjectKind {
+    /// Full commit object payload.
+    Commit = 1,
+    /// Full tree object payload.
+    Tree = 2,
+    /// Full blob object payload.
+    Blob = 3,
+    /// Delta payload that references a base by negative offset.
+    OfsDelta = 6,
+}
+
+impl PackObjectKind {
+    /// Returns the Git object header name for full objects.
+    fn git_type_name(self) -> &'static [u8] {
+        match self {
+            Self::Commit => b"commit",
+            Self::Tree => b"tree",
+            Self::Blob => b"blob",
+            Self::OfsDelta => {
+                panic!("delta objects do not have standalone git object headers")
+            }
+        }
+    }
+}
+
+/// Git identity pair used in handcrafted commit objects.
+#[derive(Debug, Clone, Copy)]
+struct GitPerson<'a> {
+    /// Display name in the commit header.
+    name: &'a str,
+    /// Email address in the commit header.
+    email: &'a str,
+}
+
+/// Author/committer identities paired for one handcrafted commit.
+#[derive(Debug, Clone, Copy)]
+struct CommitPeople<'a> {
+    /// Author identity recorded in the commit body.
+    author: GitPerson<'a>,
+    /// Committer identity recorded in the commit body.
+    committer: GitPerson<'a>,
+}
+
+/// Commit timestamp that is always rendered in Korea Standard Time (`+0900`).
+#[derive(Debug, Clone, Copy)]
+pub struct GitTimestampKst {
+    /// Unix timestamp in seconds.
+    epoch: i64,
+}
+
+impl GitTimestampKst {
+    /// Converts a 선고일자 into the deterministic noon-KST commit timestamp.
+    ///
+    /// Accepts an empty string (returns the Unix epoch) or a bare `YYYYMMDD` value. Pre-epoch
+    /// dates are clamped to `1970-01-01` so reruns keep producing the same commit ids.
+    pub fn from_judgment_date(judgment_date: &str) -> Result<Self> {
+        if judgment_date.is_empty() {
+            return Ok(Self { epoch: 0 });
+        }
+        if judgment_date.len() != 8 || !judgment_date.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("expected judgment date in YYYYMMDD form: {judgment_date}");
+        }
+
+        //
+        // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
+        // same commit ids when upstream metadata predates Unix time.
+        //
+        let effective_date = if judgment_date < "19700101" {
+            String::from("1970-01-01")
+        } else {
+            format!(
+                "{}-{}-{}",
+                &judgment_date[..4],
+                &judgment_date[4..6],
+                &judgment_date[6..8]
+            )
+        };
+
+        //
+        // Every revision commit lands at noon KST. The fixed wall-clock time keeps hashes stable
+        // while still rendering as a readable calendar date in Git history.
+        //
+        let year = effective_date[0..4].parse::<i32>()?;
+        let month = effective_date[5..7].parse::<u8>()?;
+        let day = effective_date[8..10].parse::<u8>()?;
+        let month = Month::try_from(month)?;
+        let date = Date::from_calendar_date(year, month, day)?;
+        let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
+        let offset = UtcOffset::from_hms(9, 0, 0)?;
+        Ok(Self {
+            epoch: datetime.assume_offset(offset).unix_timestamp(),
+        })
+    }
+}
+
+/// Precomputes the canonical blob id and compressed pack payload for one file body.
+pub fn precompute_blob(content: &[u8]) -> ([u8; 20], Vec<u8>) {
+    (
+        git_hash(PackObjectKind::Blob.git_type_name(), content),
+        compress(content),
+    )
+}
+
+/// Owned repository path in either the root or `{case_type}/{court_tier}/` namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RepoPathBuf {
+    /// Root-level repository file such as `README.md`.
+    RootFile(String),
+    /// Precedent Markdown file under `{case_type}/{court_tier}/<filename>.md`.
+    PrecFile {
+        /// Top-level case type directory.
+        case_type: String,
+        /// Nested court tier directory below the case type.
+        court_tier: String,
+        /// Leaf Markdown filename.
+        filename: String,
+    },
+}
+
+impl RepoPathBuf {
+    /// Creates a root-level repository path.
+    pub fn root_file(name: impl Into<String>) -> Self {
+        Self::RootFile(name.into())
+    }
+
+    /// Creates a precedent Markdown path under `{case_type}/{court_tier}/`.
+    pub fn prec_file(
+        case_type: impl Into<String>,
+        court_tier: impl Into<String>,
+        filename: impl Into<String>,
+    ) -> Self {
+        Self::PrecFile {
+            case_type: case_type.into(),
+            court_tier: court_tier.into(),
+            filename: filename.into(),
+        }
+    }
+}
+
+impl fmt::Display for RepoPathBuf {
+    /// Renders the repository path in Git's slash-separated form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootFile(name) => f.write_str(name),
+            Self::PrecFile {
+                case_type,
+                court_tier,
+                filename,
+            } => write!(f, "{case_type}/{court_tier}/{filename}"),
+        }
+    }
+}
+
+/// One tree entry inside any of the nested precedent trees.
+#[derive(Debug, Clone)]
+struct Entry {
+    /// Raw tree entry name bytes.
+    name: Vec<u8>,
+    /// Object id pointed to by the tree entry.
+    sha: [u8; 20],
+}
+
+/// Cached state for one leaf `{case_type}/{court_tier}/` subtree.
+#[derive(Debug, Default)]
+struct CourtTierGroup {
+    /// Directory name under the parent case-type tree.
+    name: Vec<u8>,
+    /// Sorted file entries inside this subtree.
+    files: Vec<Entry>,
+    /// Serialized subtree bytes kept for possible OFS_DELTA updates.
+    tree_cache: Vec<u8>,
+    /// SHA byte offsets for each file entry inside `tree_cache`.
+    file_sha_offsets: Vec<usize>,
+    /// Most recently materialized subtree SHA.
+    cached_sha: Option<[u8; 20]>,
+    /// Previous tree serialization kept as a delta base for repeated subtree updates.
+    prev_tree_bytes: Option<Vec<u8>>,
+    /// Pack byte offset of the previous subtree revision (base for OFS_DELTA).
+    prev_tree_offset: Option<u64>,
+    /// Whether file insertion changed the subtree layout since the last materialization.
+    structure_dirty: bool,
+}
+
+/// Cached state for one `{case_type}/` subtree containing multiple court-tier children.
+#[derive(Debug, Default)]
+struct CaseTypeGroup {
+    /// Directory name directly under the root tree.
+    name: Vec<u8>,
+    /// Sorted court-tier children.
+    tiers: Vec<CourtTierGroup>,
+    /// Fast lookup from court-tier name to its position in `tiers`.
+    tier_indices: HashMap<Vec<u8>, usize>,
+    /// Serialized subtree bytes kept for possible OFS_DELTA updates.
+    tree_cache: Vec<u8>,
+    /// SHA byte offsets for each tier entry inside `tree_cache`.
+    tier_sha_offsets: Vec<usize>,
+    /// Most recently materialized subtree SHA.
+    cached_sha: Option<[u8; 20]>,
+    /// Previous tree serialization kept as a delta base for repeated subtree updates.
+    prev_tree_bytes: Option<Vec<u8>>,
+    /// Pack byte offset of the previous subtree revision (base for OFS_DELTA).
+    prev_tree_offset: Option<u64>,
+    /// Tier index whose subtree SHA changed most recently.
+    dirty_tier: Option<usize>,
+    /// Whether tier insertion changed the case-type layout since the last materialization.
+    tier_structure_dirty: bool,
+}
+
+/// Cached middle-level tree state across every case-type group.
+#[derive(Debug, Default)]
+struct OuterTreeState {
+    /// Sorted case-type groups below the root tree.
+    groups: Vec<CaseTypeGroup>,
+    /// Fast lookup from case-type name to its position in `groups`.
+    group_indices: HashMap<Vec<u8>, usize>,
+    /// Case-type index that changed most recently.
+    dirty_group: Option<usize>,
+    /// Whether case-type insertion changed the outer layout.
+    structure_dirty: bool,
+}
+
+/// Root-tree entry kinds that can be patched in-place in the cached bytes.
+#[derive(Debug, Clone, Copy)]
+enum DirtyRootEntry {
+    /// One root-level file entry changed.
+    File(usize),
+    /// One case-type subtree entry changed.
+    Subtree(usize),
+}
+
+/// Cached root-tree bytes plus patch metadata for repeated commits.
+#[derive(Debug, Default)]
+struct RootTreeState {
+    /// Sorted root-level file entries.
+    files: Vec<Entry>,
+    /// Serialized root tree bytes reused across commits.
+    cache: Vec<u8>,
+    /// SHA byte offsets for each root file entry.
+    file_sha_offsets: Vec<usize>,
+    /// SHA byte offsets for each case-type subtree entry (one per outer group).
+    subtree_sha_offsets: Vec<usize>,
+    /// Most recent root-tree entry that changed.
+    dirty: Option<DirtyRootEntry>,
+    /// Most recently written root tree SHA.
+    current_sha: Option<[u8; 20]>,
+    /// Pack byte offset of the most recently written root tree (base for OFS_DELTA).
+    current_offset: Option<u64>,
+}
+
+/// One entry in the pack index, accumulated during pack writing.
+struct IdxEntry {
+    /// Object id of the packed object.
+    sha: [u8; 20],
+    /// CRC-32 of the raw pack entry bytes (header + optional base SHA + compressed data).
+    crc32: u32,
+    /// Byte offset of the entry within the pack file.
+    offset: u64,
+}
+
+/// Borrowed blob payload that was already hashed and compressed off the writer hot path.
+struct PrecomputedBlob<'a> {
+    /// Canonical Git object id for the blob body.
+    sha: [u8; 20],
+    /// Deflated PACK payload for the blob body.
+    compressed: &'a [u8],
+}
+
+/// Low-level writer that streams packfile entries directly to the final `.pack` file.
+struct PackWriter {
+    /// Buffered writer for the pack file (header already written).
+    file: BufWriter<File>,
+    /// Number of unique objects appended to the pack stream.
+    object_count: u32,
+    /// Filesystem path of the `.pack` file being written.
+    path: PathBuf,
+    /// Object ids already emitted, mapped to their byte offset inside the pack.
+    seen: HashMap<[u8; 20], u64>,
+    /// Accumulated index entries for `.idx` v2 generation.
+    idx_entries: Vec<IdxEntry>,
+    /// Running byte offset tracking how many bytes have been written so far.
+    bytes_written: u64,
+}
+
+/// Writes the generated precedent history into a fresh bare Git repository.
+pub struct BareRepoWriter {
+    /// Streaming pack writer used for all objects in the temporary repo.
+    writer: PackWriter,
+    /// Temporary bare repository path populated before the final rename.
+    temp_output: PathBuf,
+    /// Requested output path for the finished bare repository.
+    final_output: PathBuf,
+    /// Root-tree cache and patch metadata.
+    root: RootTreeState,
+    /// Middle-level (case type) tree state with nested court-tier children.
+    outer: OuterTreeState,
+    /// Parent commit id for the next handcrafted commit object.
+    parent_commit: Option<[u8; 20]>,
+    /// Whether a tree update must be materialized before the next commit.
+    tree_dirty: bool,
+}
+
+impl BareRepoWriter {
+    /// Creates a new temporary bare repository writer for the requested output path.
+    pub fn create(output: &Path) -> Result<Self> {
+        let final_output = output.to_path_buf();
+        let temp_output = {
+            let parent = output.parent().unwrap_or_else(|| Path::new("."));
+            let name = output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("invalid output path: {}", output.display()))?;
+            parent.join(format!(".{name}.tmp-{}", process::id()))
+        };
+        if temp_output.exists() {
+            remove_path(&temp_output)?;
+        }
+
+        let parent = temp_output
+            .parent()
+            .context("temporary output path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+
+        let pack_path = temp_output.join("objects/pack/tmp_pack.pack");
+        fs::create_dir_all(
+            pack_path
+                .parent()
+                .context("pack path unexpectedly missing parent")?,
+        )?;
+
+        Ok(Self {
+            writer: PackWriter::new(&pack_path)?,
+            temp_output,
+            final_output,
+            root: RootTreeState::default(),
+            outer: OuterTreeState::default(),
+            parent_commit: None,
+            tree_dirty: false,
+        })
+    }
+
+    /// Commits one rendered precedent Markdown file using bot authorship and judgment dates.
+    pub fn commit_precedent(
+        &mut self,
+        path: &RepoPathBuf,
+        markdown: &[u8],
+        blob_sha: [u8; 20],
+        compressed_blob: &[u8],
+        message: &str,
+        time: GitTimestampKst,
+    ) -> Result<()> {
+        let bot = GitPerson {
+            name: "legalize-kr-bot",
+            email: "bot@legalize.kr",
+        };
+        let blob = PrecomputedBlob {
+            sha: blob_sha,
+            compressed: compressed_blob,
+        };
+        self.commit_file(
+            path,
+            markdown,
+            blob,
+            message,
+            CommitPeople {
+                author: bot,
+                committer: bot,
+            },
+            time,
+        )
+    }
+
+    /// Commits a static repository file with the fixed initial authorship metadata.
+    pub fn commit_static(
+        &mut self,
+        path: &RepoPathBuf,
+        content: &[u8],
+        message: &str,
+        epoch: i64,
+    ) -> Result<()> {
+        let message = {
+            let mut rendered = String::from(message.trim_end());
+            rendered.push_str("\n\n");
+            rendered.push_str("Co-authored-by: Jihyeon Kim <simnalamburt@gmail.com>");
+            rendered
+        };
+        let author = GitPerson {
+            name: "Junghwan Park",
+            email: "reserve.dev@gmail.com",
+        };
+        let (blob_sha, compressed_blob) = precompute_blob(content);
+        let blob = PrecomputedBlob {
+            sha: blob_sha,
+            compressed: &compressed_blob,
+        };
+        self.commit_file(
+            path,
+            content,
+            blob,
+            &message,
+            CommitPeople {
+                author,
+                committer: author,
+            },
+            GitTimestampKst { epoch },
+        )
+    }
+
+    /// Appends the empty historical contributor commit after the initial static files.
+    pub fn commit_empty_initial_contributor(&mut self, message: &str, epoch: i64) -> Result<()> {
+        if self.parent_commit.is_none() {
+            bail!("empty contributor commit requires an existing tree");
+        }
+        let author = GitPerson {
+            name: "Jihyeon Kim",
+            email: "simnalamburt@gmail.com",
+        };
+        let root_sha = self.root_tree_sha()?;
+        let commit_sha =
+            self.write_commit(root_sha, message, author, author, GitTimestampKst { epoch })?;
+        self.parent_commit = Some(commit_sha);
+        Ok(())
+    }
+
+    /// Finalizes the pack, writes `main` as loose refs, and moves the temporary repo into place.
+    pub fn finish(mut self) -> Result<()> {
+        self.writer.finish()?;
+
+        if let Some(parent_commit) = self.parent_commit {
+            let refs_heads = self.temp_output.join("refs/heads");
+            fs::create_dir_all(&refs_heads)
+                .with_context(|| format!("failed to create {}", refs_heads.display()))?;
+            fs::write(
+                refs_heads.join("main"),
+                format!("{}\n", hex(&parent_commit)),
+            )
+            .with_context(|| format!("failed to write {}", refs_heads.join("main").display()))?;
+        }
+        fs::write(self.temp_output.join("HEAD"), "ref: refs/heads/main\n").with_context(|| {
+            format!(
+                "failed to write {}",
+                self.temp_output.join("HEAD").display()
+            )
+        })?;
+
+        if self.final_output.exists() {
+            remove_path(&self.final_output)?;
+        }
+        fs::rename(&self.temp_output, &self.final_output).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                self.temp_output.display(),
+                self.final_output.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Commits one file change after updating blob and tree state.
+    fn commit_file(
+        &mut self,
+        path: &RepoPathBuf,
+        content: &[u8],
+        blob: PrecomputedBlob<'_>,
+        message: &str,
+        people: CommitPeople<'_>,
+        time: GitTimestampKst,
+    ) -> Result<()> {
+        // Warning: HOT PATH!
+
+        match path {
+            RepoPathBuf::RootFile(name) => {
+                let (index, inserted) = upsert(&mut self.root.files, name.as_bytes());
+                if inserted {
+                    self.root.file_sha_offsets.clear();
+                    self.root.subtree_sha_offsets.clear();
+                    self.root.dirty = None;
+                } else {
+                    self.root.dirty = Some(DirtyRootEntry::File(index));
+                }
+                //
+                // Precedents are committed exactly once per serial, so the blob always goes in as a
+                // full object. No delta chain bookkeeping is needed.
+                //
+                self.writer.write_precompressed_object(
+                    PackObjectKind::Blob,
+                    content.len(),
+                    blob.sha,
+                    blob.compressed,
+                )?;
+                self.root.files[index].sha = blob.sha;
+            }
+            RepoPathBuf::PrecFile {
+                case_type,
+                court_tier,
+                filename,
+            } => {
+                let case_type_idx = self.ensure_case_type(case_type.as_bytes());
+                let tier_idx = self.ensure_court_tier(case_type_idx, court_tier.as_bytes());
+                let group = &mut self.outer.groups[case_type_idx];
+                let tier = &mut group.tiers[tier_idx];
+                let (file_idx, inserted) = upsert(&mut tier.files, filename.as_bytes());
+                if inserted {
+                    tier.structure_dirty = true;
+                }
+                //
+                // Each precedent file is committed exactly once (no amendments), so a full blob is
+                // always cheaper than constructing a delta.
+                //
+                self.writer.write_precompressed_object(
+                    PackObjectKind::Blob,
+                    content.len(),
+                    blob.sha,
+                    blob.compressed,
+                )?;
+                tier.files[file_idx].sha = blob.sha;
+                tier.cached_sha = None;
+                group.dirty_tier = Some(tier_idx);
+                group.cached_sha = None;
+                self.outer.dirty_group = Some(case_type_idx);
+                self.root.dirty = Some(DirtyRootEntry::Subtree(case_type_idx));
+            }
+        }
+
+        //
+        // Materialize the current root tree and append the commit object in order.
+        //
+        self.tree_dirty = true;
+        let root_sha = self.root_tree_sha()?;
+        let commit_sha =
+            self.write_commit(root_sha, message, people.author, people.committer, time)?;
+        self.parent_commit = Some(commit_sha);
+        Ok(())
+    }
+
+    /// Returns the stable sorted slot for `{case_type}/`, inserting it if needed.
+    fn ensure_case_type(&mut self, name: &[u8]) -> usize {
+        if let Some(&index) = self.outer.group_indices.get(name) {
+            return index;
+        }
+
+        let position = self
+            .outer
+            .groups
+            .partition_point(|group| group.name.as_slice() < name);
+        self.outer.groups.insert(
+            position,
+            CaseTypeGroup {
+                name: name.to_vec(),
+                ..CaseTypeGroup::default()
+            },
+        );
+        for index in self.outer.group_indices.values_mut() {
+            if *index >= position {
+                *index += 1;
+            }
+        }
+        self.outer.group_indices.insert(name.to_vec(), position);
+        self.outer.structure_dirty = true;
+        position
+    }
+
+    /// Returns the stable sorted slot for `{case_type}/{court_tier}/`, inserting it if needed.
+    fn ensure_court_tier(&mut self, case_type_idx: usize, name: &[u8]) -> usize {
+        let group = &mut self.outer.groups[case_type_idx];
+        if let Some(&index) = group.tier_indices.get(name) {
+            return index;
+        }
+
+        let position = group
+            .tiers
+            .partition_point(|tier| tier.name.as_slice() < name);
+        group.tiers.insert(
+            position,
+            CourtTierGroup {
+                name: name.to_vec(),
+                ..CourtTierGroup::default()
+            },
+        );
+        for index in group.tier_indices.values_mut() {
+            if *index >= position {
+                *index += 1;
+            }
+        }
+        group.tier_indices.insert(name.to_vec(), position);
+        group.tier_structure_dirty = true;
+        position
+    }
+
+    /// Materializes and returns the current root tree object id.
+    fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
+        if !self.tree_dirty
+            && let Some(sha) = self.root.current_sha
+        {
+            return Ok(sha);
+        }
+
+        //
+        // Step 1: materialize every dirty leaf tier subtree followed by its parent case-type tree.
+        //
+        if self.outer.structure_dirty {
+            for group in &mut self.outer.groups {
+                if group.tier_structure_dirty {
+                    for tier in &mut group.tiers {
+                        if tier.cached_sha.is_none() {
+                            materialize_court_tier_tree(tier, &mut self.writer)?;
+                        }
+                    }
+                } else if let Some(tier_idx) = group.dirty_tier
+                    && group.tiers[tier_idx].cached_sha.is_none()
+                {
+                    materialize_court_tier_tree(&mut group.tiers[tier_idx], &mut self.writer)?;
+                }
+                if group.cached_sha.is_none() {
+                    materialize_case_type_tree(group, &mut self.writer)?;
+                }
+            }
+            self.outer.structure_dirty = false;
+        } else if let Some(group_idx) = self.outer.dirty_group {
+            let group = &mut self.outer.groups[group_idx];
+            if group.tier_structure_dirty {
+                for tier in &mut group.tiers {
+                    if tier.cached_sha.is_none() {
+                        materialize_court_tier_tree(tier, &mut self.writer)?;
+                    }
+                }
+            } else if let Some(tier_idx) = group.dirty_tier
+                && group.tiers[tier_idx].cached_sha.is_none()
+            {
+                materialize_court_tier_tree(&mut group.tiers[tier_idx], &mut self.writer)?;
+            }
+            if group.cached_sha.is_none() {
+                materialize_case_type_tree(group, &mut self.writer)?;
+            }
+        }
+        self.outer.dirty_group = None;
+
+        //
+        // Step 2: rebuild or patch the root tree bytes.
+        //
+        let root_structure_dirty = self.root.file_sha_offsets.len() != self.root.files.len()
+            || self.root.subtree_sha_offsets.len() != self.outer.groups.len();
+
+        let root_sha = if root_structure_dirty {
+            self.root.cache.clear();
+            self.root
+                .file_sha_offsets
+                .resize(self.root.files.len(), 0);
+            self.root
+                .subtree_sha_offsets
+                .resize(self.outer.groups.len(), 0);
+
+            //
+            // Build the sorted mixed entry list. Tuples carry `(is_tree, name, sha, original_index)`
+            // so each entry can update the correct offset table after sorting.
+            //
+            let mut entries: Vec<(bool, Vec<u8>, [u8; 20], usize)> =
+                Vec::with_capacity(self.root.files.len() + self.outer.groups.len());
+            for (i, f) in self.root.files.iter().enumerate() {
+                entries.push((false, f.name.clone(), f.sha, i));
+            }
+            for (i, g) in self.outer.groups.iter().enumerate() {
+                entries.push((
+                    true,
+                    g.name.clone(),
+                    g.cached_sha.context("missing case type SHA")?,
+                    i,
+                ));
+            }
+            //
+            // Git requires directory entries to sort as though their names ended with `/`, not NUL,
+            // so mimic the same logic used in the laws compiler here.
+            //
+            entries.sort_by(|a, b| {
+                let common = a.1.len().min(b.1.len());
+                match a.1[..common].cmp(&b.1[..common]) {
+                    std::cmp::Ordering::Equal => {
+                        let a_tail = if a.0 { b'/' } else { 0 };
+                        let b_tail = if b.0 { b'/' } else { 0 };
+                        let a_next = a.1.get(common).copied().unwrap_or(a_tail);
+                        let b_next = b.1.get(common).copied().unwrap_or(b_tail);
+                        a_next.cmp(&b_next)
+                    }
+                    other => other,
+                }
+            });
+
+            for (is_tree, name, sha, orig_idx) in &entries {
+                self.root.cache.extend_from_slice(if *is_tree {
+                    b"40000 "
+                } else {
+                    b"100644 "
+                });
+                self.root.cache.extend_from_slice(name);
+                self.root.cache.push(0);
+                let sha_off = self.root.cache.len();
+                if *is_tree {
+                    self.root.subtree_sha_offsets[*orig_idx] = sha_off;
+                } else {
+                    self.root.file_sha_offsets[*orig_idx] = sha_off;
+                }
+                self.root.cache.extend_from_slice(sha);
+            }
+            self.root.dirty = None;
+            self.writer
+                .write_object(PackObjectKind::Tree, &self.root.cache)?
+        } else if let Some(dirty) = self.root.dirty.take() {
+            let (sha_offset, new_sha) = match dirty {
+                DirtyRootEntry::File(i) => {
+                    (self.root.file_sha_offsets[i], self.root.files[i].sha)
+                }
+                DirtyRootEntry::Subtree(i) => (
+                    self.root.subtree_sha_offsets[i],
+                    self.outer.groups[i]
+                        .cached_sha
+                        .context("missing case type SHA")?,
+                ),
+            };
+            let delta = make_copy_insert_delta(self.root.cache.len(), sha_offset, &new_sha);
+            self.root.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
+            let root_sha = git_hash(PackObjectKind::Tree.git_type_name(), &self.root.cache);
+            if let Some(base_offset) = self.root.current_offset {
+                self.writer.write_ofs_delta(base_offset, &delta, root_sha)?;
+            } else {
+                self.writer
+                    .write_object(PackObjectKind::Tree, &self.root.cache)?;
+            }
+            root_sha
+        } else if let Some(sha) = self.root.current_sha {
+            sha
+        } else {
+            self.writer
+                .write_object(PackObjectKind::Tree, &self.root.cache)?
+        };
+
+        self.root.current_sha = Some(root_sha);
+        self.root.current_offset = Some(self.writer.offset_of(&root_sha));
+        self.tree_dirty = false;
+        Ok(root_sha)
+    }
+
+    /// Serializes and appends one commit object to the pack stream.
+    fn write_commit(
+        &mut self,
+        tree: [u8; 20],
+        message: &str,
+        author: GitPerson<'_>,
+        committer: GitPerson<'_>,
+        time: GitTimestampKst,
+    ) -> Result<[u8; 20]> {
+        // Commit objects stay full-text because they are tiny and must exactly match Git's format.
+        use std::fmt::Write as _;
+        let mut commit = String::with_capacity(1000);
+        let tree_hex = hex_buf(&tree);
+        let tree_hex_str = std::str::from_utf8(&tree_hex).unwrap();
+        writeln!(commit, "tree {tree_hex_str}").unwrap();
+        if let Some(parent) = self.parent_commit {
+            let parent_hex = hex_buf(&parent);
+            let parent_hex_str = std::str::from_utf8(&parent_hex).unwrap();
+            writeln!(commit, "parent {parent_hex_str}").unwrap();
+        }
+        write!(
+            commit,
+            "author {} <{}> {} +0900\ncommitter {} <{}> {} +0900\n\n{message}",
+            author.name, author.email, time.epoch, committer.name, committer.email, time.epoch
+        )
+        .unwrap();
+        self.writer
+            .write_object(PackObjectKind::Commit, commit.as_bytes())
+    }
+}
+
+/// Materializes one leaf court-tier subtree, emitting a pack object if needed.
+fn materialize_court_tier_tree(tier: &mut CourtTierGroup, writer: &mut PackWriter) -> Result<()> {
+    if tier.cached_sha.is_some() {
+        return Ok(());
+    }
+
+    //
+    // Precedents only grow each subtree, so every materialization rebuilds the file list in order.
+    // Keep the serialized bytes around so future updates can emit tight OFS_DELTA payloads.
+    //
+    let mut tree = Vec::with_capacity(tier.tree_cache.len() + 64);
+    tier.file_sha_offsets.clear();
+    tier.file_sha_offsets.reserve(tier.files.len());
+    for entry in &tier.files {
+        tree.extend_from_slice(b"100644 ");
+        tree.extend_from_slice(&entry.name);
+        tree.push(0);
+        tier.file_sha_offsets.push(tree.len());
+        tree.extend_from_slice(&entry.sha);
+    }
+    let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
+
+    if let (Some(prev_bytes), Some(prev_offset)) =
+        (tier.prev_tree_bytes.as_ref(), tier.prev_tree_offset)
+    {
+        let delta = create_delta(prev_bytes, &tree);
+        if delta.len() < tree.len() * 3 / 4 {
+            writer.write_ofs_delta(prev_offset, &delta, sha)?;
+        } else {
+            writer.write_object(PackObjectKind::Tree, &tree)?;
+        }
+    } else {
+        writer.write_object(PackObjectKind::Tree, &tree)?;
+    }
+
+    tier.prev_tree_bytes = Some(tree.clone());
+    tier.prev_tree_offset = Some(writer.offset_of(&sha));
+    tier.cached_sha = Some(sha);
+    tier.tree_cache = tree;
+    tier.structure_dirty = false;
+    Ok(())
+}
+
+/// Materializes one case-type subtree across its court-tier children.
+fn materialize_case_type_tree(group: &mut CaseTypeGroup, writer: &mut PackWriter) -> Result<()> {
+    if group.cached_sha.is_some() {
+        return Ok(());
+    }
+
+    let tier_structure_changed = group.tier_sha_offsets.len() != group.tiers.len();
+
+    if tier_structure_changed {
+        //
+        // Rebuild the middle-level tree whenever a new court tier appears, then remember the
+        // serialized bytes so subsequent single-SHA updates can stay on the OFS_DELTA fast path.
+        //
+        group.tree_cache.clear();
+        group.tier_sha_offsets.resize(group.tiers.len(), 0);
+        for (i, tier) in group.tiers.iter().enumerate() {
+            group.tree_cache.extend_from_slice(b"40000 ");
+            group.tree_cache.extend_from_slice(&tier.name);
+            group.tree_cache.push(0);
+            group.tier_sha_offsets[i] = group.tree_cache.len();
+            group
+                .tree_cache
+                .extend_from_slice(&tier.cached_sha.context("missing tier SHA")?);
+        }
+        let sha = git_hash(PackObjectKind::Tree.git_type_name(), &group.tree_cache);
+        if let (Some(prev_bytes), Some(prev_offset)) =
+            (group.prev_tree_bytes.as_ref(), group.prev_tree_offset)
+        {
+            let delta = create_delta(prev_bytes, &group.tree_cache);
+            if delta.len() < group.tree_cache.len() * 3 / 4 {
+                writer.write_ofs_delta(prev_offset, &delta, sha)?;
+            } else {
+                writer.write_object(PackObjectKind::Tree, &group.tree_cache)?;
+            }
+        } else {
+            writer.write_object(PackObjectKind::Tree, &group.tree_cache)?;
+        }
+        group.prev_tree_bytes = Some(group.tree_cache.clone());
+        group.prev_tree_offset = Some(writer.offset_of(&sha));
+        group.cached_sha = Some(sha);
+    } else if let Some(tier_idx) = group.dirty_tier.take() {
+        let new_tier_sha = group.tiers[tier_idx]
+            .cached_sha
+            .context("missing tier SHA")?;
+        let sha_offset = group.tier_sha_offsets[tier_idx];
+        let delta = make_copy_insert_delta(group.tree_cache.len(), sha_offset, &new_tier_sha);
+        group.tree_cache[sha_offset..sha_offset + 20].copy_from_slice(&new_tier_sha);
+        let sha = git_hash(PackObjectKind::Tree.git_type_name(), &group.tree_cache);
+        if let Some(prev_offset) = group.prev_tree_offset {
+            writer.write_ofs_delta(prev_offset, &delta, sha)?;
+        } else {
+            writer.write_object(PackObjectKind::Tree, &group.tree_cache)?;
+        }
+        group.prev_tree_bytes = Some(group.tree_cache.clone());
+        group.prev_tree_offset = Some(writer.offset_of(&sha));
+        group.cached_sha = Some(sha);
+    } else if group.cached_sha.is_none() {
+        //
+        // Defensive path: if nothing looks dirty but the cache was invalidated, fall back to a
+        // plain rewrite so downstream code always sees a fresh SHA.
+        //
+        let sha = writer.write_object(PackObjectKind::Tree, &group.tree_cache)?;
+        group.prev_tree_bytes = Some(group.tree_cache.clone());
+        group.prev_tree_offset = Some(writer.offset_of(&sha));
+        group.cached_sha = Some(sha);
+    }
+    group.dirty_tier = None;
+    group.tier_structure_dirty = false;
+    Ok(())
+}
+
+impl PackWriter {
+    /// Returns the pack byte offset where the given object was written.
+    fn offset_of(&self, sha: &[u8; 20]) -> u64 {
+        self.seen[sha]
+    }
+
+    /// Creates a new pack writer that writes directly to the final `.pack` file.
+    fn new(path: &Path) -> Result<Self> {
+        let mut file = BufWriter::with_capacity(4 << 20, File::create(path)?);
+        // Write PACK header with placeholder object count (patched in finish()).
+        let pack_header: [u8; 12] = [
+            b'P', b'A', b'C', b'K', // magic
+            0, 0, 0, 2, // version 2
+            0, 0, 0, 0, // object count placeholder
+        ];
+        file.write_all(&pack_header)?;
+        Ok(Self {
+            file,
+            object_count: 0,
+            path: path.to_path_buf(),
+            seen: HashMap::default(),
+            idx_entries: Vec::new(),
+            bytes_written: 12,
+        })
+    }
+
+    /// Appends one full object to the pack unless it was already emitted.
+    fn write_object(&mut self, object_type: PackObjectKind, data: &[u8]) -> Result<[u8; 20]> {
+        let sha = git_hash(object_type.git_type_name(), data);
+        self.write_precompressed_object(object_type, data.len(), sha, &compress(data))
+    }
+
+    /// Appends one `OFS_DELTA` object to the pack unless the result id already exists.
+    fn write_ofs_delta(
+        &mut self,
+        base_offset: u64,
+        delta: &[u8],
+        result_sha: [u8; 20],
+    ) -> Result<[u8; 20]> {
+        if self.seen.contains_key(&result_sha) {
+            return Ok(result_sha);
+        }
+
+        let offset = self.bytes_written;
+        self.seen.insert(result_sha, offset);
+        let header_bytes = encode_pack_entry_header(PackObjectKind::OfsDelta, delta.len());
+        let ofs_bytes = encode_ofs_delta_offset(offset - base_offset);
+        let compressed = compress(delta);
+
+        let mut crc = Crc32Hasher::new();
+        crc.update(&header_bytes);
+        crc.update(&ofs_bytes);
+        crc.update(&compressed);
+
+        self.file.write_all(&header_bytes)?;
+        self.file.write_all(&ofs_bytes)?;
+        self.file.write_all(&compressed)?;
+        self.bytes_written +=
+            header_bytes.len() as u64 + ofs_bytes.len() as u64 + compressed.len() as u64;
+        self.object_count += 1;
+        self.idx_entries.push(IdxEntry {
+            sha: result_sha,
+            crc32: crc.finalize(),
+            offset,
+        });
+        Ok(result_sha)
+    }
+
+    /// Appends one full object whose object id and compressed payload were prepared earlier.
+    fn write_precompressed_object(
+        &mut self,
+        object_type: PackObjectKind,
+        size: usize,
+        sha: [u8; 20],
+        compressed: &[u8],
+    ) -> Result<[u8; 20]> {
+        if self.seen.contains_key(&sha) {
+            return Ok(sha);
+        }
+
+        let offset = self.bytes_written;
+        self.seen.insert(sha, offset);
+        let header_bytes = encode_pack_entry_header(object_type, size);
+
+        let mut crc = Crc32Hasher::new();
+        crc.update(&header_bytes);
+        crc.update(compressed);
+
+        self.file.write_all(&header_bytes)?;
+        self.file.write_all(compressed)?;
+        self.bytes_written += header_bytes.len() as u64 + compressed.len() as u64;
+        self.object_count += 1;
+        self.idx_entries.push(IdxEntry {
+            sha,
+            crc32: crc.finalize(),
+            offset,
+        });
+        Ok(sha)
+    }
+
+    /// Finalizes the pack file (patches object count, appends checksum) and generates the `.idx`.
+    fn finish(&mut self) -> Result<()> {
+        self.file.flush()?;
+
+        let inner = self.file.get_mut();
+        inner.seek(SeekFrom::Start(8))?;
+        inner.write_all(&self.object_count.to_be_bytes())?;
+        inner.flush()?;
+
+        let mut reader = BufReader::with_capacity(4 << 20, File::open(&self.path)?);
+        let mut hasher = Sha1::new();
+        let mut buffer = [0u8; 1 << 20];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+        drop(reader);
+        let pack_checksum: [u8; 20] = hasher.finalize().into();
+
+        let mut pack_file = fs::OpenOptions::new().append(true).open(&self.path)?;
+        pack_file.write_all(&pack_checksum)?;
+        pack_file.flush()?;
+        drop(pack_file);
+
+        self.write_idx_v2(&pack_checksum)?;
+
+        let checksum_hex = hex(&pack_checksum);
+        let pack_dir = self.path.parent().context("pack path has no parent")?;
+        let final_pack = pack_dir.join(format!("pack-{checksum_hex}.pack"));
+        let final_idx = pack_dir.join(format!("pack-{checksum_hex}.idx"));
+        let tmp_idx = self.path.with_extension("idx");
+        fs::rename(&self.path, &final_pack)?;
+        fs::rename(&tmp_idx, &final_idx)?;
+        Ok(())
+    }
+
+    /// Writes the `.idx` v2 index file alongside the pack.
+    fn write_idx_v2(&mut self, pack_checksum: &[u8; 20]) -> Result<()> {
+        self.idx_entries.sort_unstable_by(|a, b| a.sha.cmp(&b.sha));
+
+        let idx_path = self.path.with_extension("idx");
+        let mut f = BufWriter::with_capacity(4 << 20, File::create(&idx_path)?);
+        let mut hasher = Sha1::new();
+
+        let mut write = |data: &[u8]| -> Result<()> {
+            f.write_all(data)?;
+            hasher.update(data);
+            Ok(())
+        };
+
+        write(&[0xff, 0x74, 0x4f, 0x63])?;
+        write(&[0x00, 0x00, 0x00, 0x02])?;
+
+        let mut fanout = [0u32; 256];
+        for entry in &self.idx_entries {
+            fanout[entry.sha[0] as usize] += 1;
+        }
+        for i in 1..256 {
+            fanout[i] += fanout[i - 1];
+        }
+        for count in &fanout {
+            write(&count.to_be_bytes())?;
+        }
+
+        for entry in &self.idx_entries {
+            write(&entry.sha)?;
+        }
+
+        for entry in &self.idx_entries {
+            write(&entry.crc32.to_be_bytes())?;
+        }
+
+        let mut large_offsets = Vec::new();
+        for entry in &self.idx_entries {
+            if entry.offset >= 0x8000_0000 {
+                let large_idx = large_offsets.len() as u32;
+                write(&(large_idx | 0x8000_0000).to_be_bytes())?;
+                large_offsets.push(entry.offset);
+            } else {
+                write(&(entry.offset as u32).to_be_bytes())?;
+            }
+        }
+
+        for &off in &large_offsets {
+            write(&off.to_be_bytes())?;
+        }
+
+        write(pack_checksum)?;
+
+        f.flush()?;
+        let idx_checksum: [u8; 20] = hasher.finalize().into();
+        f.write_all(&idx_checksum)?;
+        f.flush()?;
+
+        Ok(())
+    }
+}
+
+/// Encodes the variable-length PACK entry header into a stack buffer and returns it.
+#[inline]
+fn encode_pack_entry_header(object_type: PackObjectKind, size: usize) -> SmallVec<[u8; 16]> {
+    let mut buf = SmallVec::new();
+    let mut header = ((object_type as u8 & 0b111) << 4) | (size as u8 & 0x0f);
+    let mut remaining = size >> 4;
+    if remaining > 0 {
+        header |= 0x80;
+    }
+    buf.push(header);
+    while remaining > 0 {
+        let mut byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining > 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+    }
+    buf
+}
+
+/// Encodes the negative offset for an `OFS_DELTA` pack entry (bijective base-128, big-endian).
+#[inline]
+fn encode_ofs_delta_offset(mut offset: u64) -> SmallVec<[u8; 16]> {
+    let mut buf = SmallVec::<[u8; 16]>::new();
+    buf.push((offset & 0x7f) as u8);
+    offset >>= 7;
+    while offset > 0 {
+        offset -= 1;
+        buf.push(0x80 | (offset & 0x7f) as u8);
+        offset >>= 7;
+    }
+    buf.reverse();
+    buf
+}
+
+/// Deletes a file or directory tree at `path`.
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Inserts a sorted tree entry if needed and returns its index plus insertion status.
+fn upsert(entries: &mut Vec<Entry>, name: &[u8]) -> (usize, bool) {
+    let index = entries.partition_point(|entry| entry.name.as_slice() < name);
+    if entries.get(index).map(|e| e.name.as_slice()) == Some(name) {
+        (index, false)
+    } else {
+        entries.insert(
+            index,
+            Entry {
+                name: name.to_vec(),
+                sha: [0; 20],
+            },
+        );
+        (index, true)
+    }
+}
+
+thread_local! {
+    /// Reusable scratch buffer for compression output to avoid per-call allocation.
+    static COMP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+
+    /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
+    #[cfg(feature = "default")]
+    static COMPRESSOR: RefCell<libdeflater::Compressor> =
+        RefCell::new(libdeflater::Compressor::new(libdeflater::CompressionLvl::new(1).unwrap()));
+}
+
+/// Compresses one pack payload with the current fast zlib setting.
+fn compress(data: &[u8]) -> Vec<u8> {
+    COMP_BUF.with(|buf_cell| {
+        #[cfg(feature = "default")]
+        return COMPRESSOR.with(|comp_cell| {
+            let mut comp = comp_cell.borrow_mut();
+            let mut buf = buf_cell.borrow_mut();
+            let bound = comp.zlib_compress_bound(data.len());
+            buf.resize(bound, 0);
+            let actual = comp
+                .zlib_compress(data, &mut buf)
+                .expect("zlib_compress_bound() must allocate enough space");
+            buf[..actual].to_vec()
+        });
+
+        #[cfg(not(feature = "default"))]
+        {
+            use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
+
+            let mut buf = buf_cell.borrow_mut();
+            buf.resize(compress_bound(data.len()), 0);
+            let (compressed, rc) = compress_slice(&mut buf, data, DeflateConfig::new(1));
+            assert_eq!(rc, ReturnCode::Ok);
+            compressed.to_vec()
+        }
+    })
+}
+
+/// Fixed block width used by the blob delta matcher.
+const DELTA_BLOCK_SIZE: usize = 16;
+
+/// Builds a Git copy/insert delta from `src` to `dst`.
+#[inline(never)]
+fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    let mut delta = Vec::with_capacity(dst.len() / 2);
+    encode_varint(&mut delta, src.len());
+    encode_varint(&mut delta, dst.len());
+
+    if src.len() < DELTA_BLOCK_SIZE {
+        emit_inserts(&mut delta, dst);
+        return delta;
+    }
+
+    let (source_blocks, _) = src.as_chunks();
+    let source_block_count = source_blocks.len();
+    let mut index: HashMap<u32, SmallVec<[usize; 4]>> =
+        HashMap::with_capacity_and_hasher(source_block_count, Default::default());
+    for (block_index, block) in source_blocks.iter().enumerate() {
+        index
+            .entry(block_hash(block))
+            .or_default()
+            .push(block_index * DELTA_BLOCK_SIZE);
+    }
+
+    let mut destination_offset = 0usize;
+    let mut pending = Vec::new();
+
+    while destination_offset < dst.len() {
+        let mut best_source_offset = 0usize;
+        let mut best_len = 0usize;
+
+        if let Some(block) = dst[destination_offset..].first_chunk() {
+            let hash = block_hash(block);
+            if let Some(candidates) = index.get(&hash) {
+                for &source_offset in candidates {
+                    let match_len = match_length(&src[source_offset..], &dst[destination_offset..]);
+                    if match_len > best_len {
+                        best_len = match_len;
+                        best_source_offset = source_offset;
+                    }
+                }
+            }
+        }
+
+        if best_len >= DELTA_BLOCK_SIZE {
+            flush_inserts(&mut delta, &mut pending);
+            emit_copy(&mut delta, best_source_offset, best_len);
+            destination_offset += best_len;
+        } else {
+            pending.push(dst[destination_offset]);
+            destination_offset += 1;
+        }
+    }
+
+    flush_inserts(&mut delta, &mut pending);
+    delta
+}
+
+/// Builds a tiny copy/insert delta that swaps a single 20-byte SHA inside a cached tree.
+fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Vec<u8> {
+    let mut delta = Vec::with_capacity(64);
+    encode_varint(&mut delta, total);
+    encode_varint(&mut delta, total);
+
+    if offset > 0 {
+        emit_copy(&mut delta, 0, offset);
+    }
+
+    delta.push(20);
+    delta.extend_from_slice(new_sha);
+
+    let tail_offset = offset + 20;
+    let tail_size = total - tail_offset;
+    if tail_size > 0 {
+        emit_copy(&mut delta, tail_offset, tail_size);
+    }
+
+    delta
+}
+
+/// Emits one Git delta copy instruction.
+fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
+    let mut command = 0x80;
+    let mut args = [0_u8; 7];
+    let mut arg_len = 0usize;
+    let mut push_arg = |byte| {
+        args[arg_len] = byte;
+        arg_len += 1;
+    };
+    if offset & 0xff != 0 {
+        command |= 0x01;
+        push_arg((offset & 0xff) as u8);
+    }
+    if offset & 0xff00 != 0 {
+        command |= 0x02;
+        push_arg(((offset >> 8) & 0xff) as u8);
+    }
+    if offset & 0xff0000 != 0 {
+        command |= 0x04;
+        push_arg(((offset >> 16) & 0xff) as u8);
+    }
+    if offset & 0xff000000 != 0 {
+        command |= 0x08;
+        push_arg(((offset >> 24) & 0xff) as u8);
+    }
+    if size & 0xff != 0 {
+        command |= 0x10;
+        push_arg((size & 0xff) as u8);
+    }
+    if size & 0xff00 != 0 {
+        command |= 0x20;
+        push_arg(((size >> 8) & 0xff) as u8);
+    }
+    if size & 0xff0000 != 0 {
+        command |= 0x40;
+        push_arg(((size >> 16) & 0xff) as u8);
+    }
+    out.push(command);
+    out.extend_from_slice(&args[..arg_len]);
+}
+
+/// Hashes one fixed-size block for delta index lookup.
+fn block_hash(data: &[u8; DELTA_BLOCK_SIZE]) -> u32 {
+    let left = u64::from_ne_bytes(data[..8].try_into().unwrap());
+    let right = u64::from_ne_bytes(data[8..].try_into().unwrap());
+    let mixed = left.wrapping_mul(0x9e37_79b1_85eb_ca87)
+        ^ right.rotate_left(23).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    (mixed ^ (mixed >> 32)) as u32
+}
+
+/// Returns the byte length of the common run starting at the two offsets.
+#[inline(always)]
+fn match_length(src: &[u8], dst: &[u8]) -> usize {
+    const WORD_SIZE: usize = std::mem::size_of::<usize>();
+
+    let max = std::cmp::min(src.len(), dst.len());
+
+    let mut len = 0usize;
+    while len + WORD_SIZE <= max {
+        let src_word = usize::from_ne_bytes(src[len..len + WORD_SIZE].try_into().unwrap());
+        let dst_word = usize::from_ne_bytes(dst[len..len + WORD_SIZE].try_into().unwrap());
+        if src_word == dst_word {
+            len += WORD_SIZE;
+            continue;
+        }
+
+        let mismatch = src_word ^ dst_word;
+        let mismatch_bits = if cfg!(target_endian = "little") {
+            mismatch.trailing_zeros()
+        } else {
+            mismatch.leading_zeros()
+        };
+        return len + (mismatch_bits as usize / 8);
+    }
+    while len < max && src[len] == dst[len] {
+        len += 1;
+    }
+    len
+}
+
+/// Emits literal insert commands, chunked to Git's 127-byte opcode limit.
+fn emit_inserts(out: &mut Vec<u8>, data: &[u8]) {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let chunk_len = std::cmp::min(127, data.len() - offset);
+        out.push(chunk_len as u8);
+        out.extend_from_slice(&data[offset..offset + chunk_len]);
+        offset += chunk_len;
+    }
+}
+
+/// Flushes buffered literal bytes into insert commands.
+fn flush_inserts(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if !pending.is_empty() {
+        emit_inserts(out, pending);
+        pending.clear();
+    }
+}
+
+/// Encodes one Git-style little-endian base-128 integer.
+fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
+    while value >= 128 {
+        out.push((value & 0x7f) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// Computes the canonical Git object id for one unhashed object body.
+fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    let mut len_buf = [0_u8; 20];
+    let mut cursor = len_buf.len();
+    let mut value = data.len();
+    loop {
+        cursor -= 1;
+        len_buf[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+
+    hasher.update(type_name);
+    hasher.update(b" ");
+    hasher.update(&len_buf[cursor..]);
+    hasher.update([0]);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Stack-based hex encoding for the commit write hot path (no heap allocation).
+fn hex_buf(sha: &[u8; 20]) -> [u8; 40] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 40];
+    for (i, &b) in sha.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0xf) as usize];
+    }
+    buf
+}
+
+/// Hex-encodes one object id for refs, logging, and non-hot-path usage.
+fn hex(sha: &[u8; 20]) -> String {
+    let buf = hex_buf(sha);
+    String::from_utf8(buf.to_vec()).expect("hex digits are valid UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// Creates a Git command with user config disabled for deterministic behavior.
+    fn git_command() -> Command {
+        let mut command = Command::new("git");
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env_remove("GIT_DIR");
+        command.env_remove("GIT_WORK_TREE");
+        command
+    }
+
+    /// Converts a failed Git subprocess result into a rich error.
+    fn ensure_command_success(output: Output, context: &str) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        bail!(
+            "{context}: exit status {}{}{}",
+            output.status,
+            if stderr.is_empty() { "" } else { "\nstderr:\n" },
+            if stderr.is_empty() {
+                String::new()
+            } else if stdout.is_empty() {
+                stderr
+            } else {
+                format!("{stderr}\nstdout:\n{stdout}")
+            }
+        )
+    }
+
+    fn output_repo(temp: &TempDir) -> PathBuf {
+        temp.path().join("output.git")
+    }
+
+    fn new_writer(temp: &TempDir) -> (PathBuf, BareRepoWriter) {
+        let output = output_repo(temp);
+        let writer = BareRepoWriter::create(&output).unwrap();
+        (output, writer)
+    }
+
+    #[test]
+    fn clamps_pre_epoch_dates() {
+        let temp = TempDir::new().unwrap();
+        let (output, mut writer) = new_writer(&temp);
+        let (blob_sha, compressed_blob) = precompute_blob(b"body");
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("민사", "대법원", "2024가합1.md"),
+                b"body",
+                blob_sha,
+                &compressed_blob,
+                "message",
+                GitTimestampKst::from_judgment_date("19491021").unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let epoch = git_stdout(&output, ["show", "-s", "--format=%at", "HEAD"]);
+        let date = git_stdout(&output, ["show", "-s", "--format=%ai", "HEAD"]);
+        assert_eq!(epoch.trim(), "10800");
+        assert_eq!(date.trim(), "1970-01-01 12:00:00 +0900");
+    }
+
+    #[test]
+    fn empty_judgment_date_uses_unix_epoch() {
+        let ts = GitTimestampKst::from_judgment_date("").unwrap();
+        // Internal accessor avoided, cheap reflection instead: emit one commit and verify.
+        let temp = TempDir::new().unwrap();
+        let (output, mut writer) = new_writer(&temp);
+        let (blob_sha, compressed_blob) = precompute_blob(b"body");
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("기타", "미분류", "serial.md"),
+                b"body",
+                blob_sha,
+                &compressed_blob,
+                "message",
+                ts,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let epoch = git_stdout(&output, ["show", "-s", "--format=%at", "HEAD"]);
+        assert_eq!(epoch.trim(), "0");
+    }
+
+    #[test]
+    fn rejects_non_compact_judgment_dates() {
+        let error = GitTimestampKst::from_judgment_date("2024-01-01").unwrap_err();
+        assert!(error.to_string().contains("YYYYMMDD"));
+    }
+
+    #[test]
+    fn builds_three_level_tree_layout() {
+        let temp = TempDir::new().unwrap();
+        let (output, mut writer) = new_writer(&temp);
+        writer
+            .commit_static(
+                &RepoPathBuf::root_file("README.md"),
+                b"hello\n",
+                "initial commit",
+                1_774_839_600,
+            )
+            .unwrap();
+        let (blob_sha, compressed_blob) = precompute_blob(b"case body\n");
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("민사", "대법원", "2024가1.md"),
+                b"case body\n",
+                blob_sha,
+                &compressed_blob,
+                "판례: a",
+                GitTimestampKst::from_judgment_date("20240101").unwrap(),
+            )
+            .unwrap();
+        let (blob_sha2, compressed_blob2) = precompute_blob(b"case body 2\n");
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("민사", "하급심", "2024가2.md"),
+                b"case body 2\n",
+                blob_sha2,
+                &compressed_blob2,
+                "판례: b",
+                GitTimestampKst::from_judgment_date("20240102").unwrap(),
+            )
+            .unwrap();
+        let (blob_sha3, compressed_blob3) = precompute_blob(b"case body 3\n");
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("형사", "대법원", "2024도3.md"),
+                b"case body 3\n",
+                blob_sha3,
+                &compressed_blob3,
+                "판례: c",
+                GitTimestampKst::from_judgment_date("20240103").unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "4"
+        );
+        assert_eq!(
+            git_stdout(&output, ["show", "HEAD:민사/대법원/2024가1.md"]),
+            "case body\n"
+        );
+        assert_eq!(
+            git_stdout(&output, ["show", "HEAD:민사/하급심/2024가2.md"]),
+            "case body 2\n"
+        );
+        assert_eq!(
+            git_stdout(&output, ["show", "HEAD:형사/대법원/2024도3.md"]),
+            "case body 3\n"
+        );
+    }
+
+    #[test]
+    fn finished_repo_is_cloneable_without_git_init_scaffolding() {
+        let temp = TempDir::new().unwrap();
+        let clone = temp.path().join("clone");
+        let (output, mut writer) = new_writer(&temp);
+        writer
+            .commit_static(
+                &RepoPathBuf::root_file("README.md"),
+                b"hello\n",
+                "initial commit",
+                1_774_839_600,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert!(!output.join("config").exists());
+        assert!(!output.join("description").exists());
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "1"
+        );
+
+        let clone_output = git_command()
+            .arg("clone")
+            .arg(&output)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        ensure_command_success(clone_output, "git clone").unwrap();
+        assert_eq!(
+            fs::read_to_string(clone.join("README.md")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+        let mut command = git_command();
+        command.arg("-C").arg(repo);
+        for arg in args {
+            command.arg(arg);
+        }
+
+        let output = command.output().unwrap();
+        let stdout = output.stdout.clone();
+        ensure_command_success(output, "git test helper").unwrap();
+        String::from_utf8(stdout).unwrap()
+    }
+}
