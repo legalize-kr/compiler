@@ -11,6 +11,18 @@ use crate::xml_parser::{LawDetail, LawMetadata};
 /// Child-law suffixes that share a parent directory in the output tree.
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
 
+/// Classification of a planned entry relative to parent-law grouping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A root-level law (법률) or anything else not classified as a child.
+    Root,
+    /// A 시행령/시행규칙 whose parent group name was derived from the child name.
+    Child {
+        /// Normalized, space-stripped parent law group name (matches `Root.group`).
+        parent_group: String,
+    },
+}
+
 /// Derived metadata shared by Markdown rendering and commit-message generation.
 #[derive(Debug)]
 struct PreparedMetadata {
@@ -44,24 +56,45 @@ pub struct PathRegistry {
 }
 
 impl PathRegistry {
-    /// Returns the Markdown path for a law name/type pair.
-    pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> RepoPathBuf {
+    /// Returns the Markdown path and entry classification for a law name/type pair.
+    pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> (RepoPathBuf, EntryKind) {
         //
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
         // directory instead of getting their own top-level group names.
         //
-        let (group, filename) = {
-            let normalized = normalize_law_name(law_name);
-            let child_path = CHILD_SUFFIXES.iter().find_map(|(suffix, filename)| {
-                normalized
-                    .strip_suffix(suffix)
-                    .map(|group| (group, *filename))
-            });
-            if let Some((group, filename)) = child_path {
-                (group.replace(' ', ""), filename.to_owned())
+        let normalized = normalize_law_name(law_name);
+        let child_match = CHILD_SUFFIXES.iter().find_map(|(suffix, filename)| {
+            normalized
+                .strip_suffix(suffix)
+                .map(|group| (group, *filename))
+        });
+        let (group, filename, kind) = if let Some((group, filename)) = child_match {
+            let group = group.replace(' ', "");
+            //
+            // Only promote to Child when the law type actually signals a subordinate 법령. A file
+            // that is typed 법률 but happens to end with " 시행령" (e.g. a 법률 whose name matches
+            // the suffix) stays classified as Root so orphan detection doesn't misfire.
+            //
+            let is_child = !law_type.is_empty() && law_type != "법률";
+            let kind = if is_child {
+                EntryKind::Child {
+                    parent_group: group.clone(),
+                }
             } else {
-                (normalized.replace(' ', ""), law_type.to_owned())
-            }
+                EntryKind::Root
+            };
+            let filename = if is_child {
+                filename.to_owned()
+            } else {
+                law_type.to_owned()
+            };
+            (group, filename, kind)
+        } else {
+            (
+                normalized.replace(' ', ""),
+                law_type.to_owned(),
+                EntryKind::Root,
+            )
         };
 
         //
@@ -77,12 +110,12 @@ impl PathRegistry {
                 qualified.clone(),
                 (law_name.to_owned(), law_type.to_owned()),
             );
-            return qualified;
+            return (qualified, kind);
         }
 
         self.assigned
             .insert(base.clone(), (law_name.to_owned(), law_type.to_owned()));
-        base
+        (base, kind)
     }
 }
 
@@ -458,13 +491,37 @@ mod tests {
     #[test]
     fn path_registry_matches_existing_collision_rule() {
         let mut registry = PathRegistry::default();
+        let (path, kind) = registry.get_law_path("테스트법 시행규칙", "부령");
+        assert_eq!(path, RepoPathBuf::kr_file("테스트법", "시행규칙.md"));
         assert_eq!(
-            registry.get_law_path("테스트법 시행규칙", "부령"),
-            RepoPathBuf::kr_file("테스트법", "시행규칙.md")
+            kind,
+            EntryKind::Child {
+                parent_group: String::from("테스트법"),
+            }
         );
+        let (path, kind) = registry.get_law_path("테스트법 시행규칙", "총리령");
+        assert_eq!(path, RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md"));
         assert_eq!(
-            registry.get_law_path("테스트법 시행규칙", "총리령"),
-            RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md")
+            kind,
+            EntryKind::Child {
+                parent_group: String::from("테스트법"),
+            }
+        );
+    }
+
+    #[test]
+    fn child_classification_requires_non_bup_law_type() {
+        let mut registry = PathRegistry::default();
+        let (_, kind) = registry.get_law_path("테스트 시행령", "법률");
+        assert_eq!(kind, EntryKind::Root);
+
+        let mut registry = PathRegistry::default();
+        let (_, kind) = registry.get_law_path("테스트 시행령", "대통령령");
+        assert_eq!(
+            kind,
+            EntryKind::Child {
+                parent_group: String::from("테스트"),
+            }
         );
     }
 
