@@ -778,9 +778,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
         let head = value["head_commit_sha"].as_str().unwrap();
         assert_eq!(head.len(), 40);
-        assert!(head.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(
+            head.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
     }
-
 
     #[test]
     fn end_to_end_builds_bare_repo() {
