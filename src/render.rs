@@ -500,7 +500,10 @@ mod tests {
             }
         );
         let (path, kind) = registry.get_law_path("테스트법 시행규칙", "총리령");
-        assert_eq!(path, RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md"));
+        assert_eq!(
+            path,
+            RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md")
+        );
         assert_eq!(
             kind,
             EntryKind::Child {
