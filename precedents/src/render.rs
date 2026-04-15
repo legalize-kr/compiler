@@ -28,7 +28,7 @@ pub fn get_precedent_path(
     let filename = if raw_case_no.is_empty() {
         metadata.serial.clone()
     } else {
-        sanitize_case_number(raw_case_no)
+        cap_filename_bytes(&sanitize_case_number(raw_case_no), &metadata.serial)
     };
 
     let base_filename = format!("{filename}.md");
@@ -113,6 +113,26 @@ pub fn sanitize_case_number(case_no: &str) -> String {
     remaining_parens_re()
         .replace_all(&comma_normalized, "_$1")
         .into_owned()
+}
+
+/// Maximum byte length for a filename stem (leaves headroom for `.md` and the
+/// collision `_{serial}` suffix within the 255-byte `NAME_MAX` limit on APFS).
+const MAX_FILENAME_STEM_BYTES: usize = 180;
+
+/// Caps a filename stem to `MAX_FILENAME_STEM_BYTES` bytes, appending
+/// `_{serial}` when truncation occurs so the resulting path stays unique and
+/// traceable back to the source precedent.
+pub fn cap_filename_bytes(filename: &str, serial: &str) -> String {
+    if filename.len() <= MAX_FILENAME_STEM_BYTES {
+        return filename.to_owned();
+    }
+    let suffix = format!("_{serial}");
+    let keep = MAX_FILENAME_STEM_BYTES.saturating_sub(suffix.len());
+    let mut end = keep;
+    while end > 0 && !filename.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &filename[..end], suffix)
 }
 
 /// Pattern matching `<br>` and `<br/>` tags during HTML stripping.
@@ -333,6 +353,43 @@ mod tests {
         );
         assert_eq!(first.to_string(), "민사/대법원/2024가합1.md");
         assert_eq!(second.to_string(), "민사/대법원/2024가합1_200.md");
+    }
+
+    #[test]
+    fn long_merged_case_numbers_are_capped_within_name_max() {
+        let many_numbers: Vec<String> = (700..1000).map(|n| n.to_string()).collect();
+        let long_case = format!(
+            "2011고합669, {} (병합) (분리)",
+            many_numbers.join(", ")
+        );
+        let mut registry = PathRegistry::default();
+        let path = get_precedent_path(
+            &PrecedentMetadata {
+                serial: String::from("123456"),
+                case_no: long_case,
+                court_code: String::from("400202"),
+                case_type_raw: String::from("형사"),
+                ..PrecedentMetadata::default()
+            },
+            &mut registry,
+        );
+        let path_str = path.to_string();
+        let leaf = path_str.rsplit('/').next().unwrap();
+        assert!(
+            leaf.len() <= 200,
+            "leaf filename must fit NAME_MAX headroom: {} bytes -> {}",
+            leaf.len(),
+            leaf
+        );
+        assert!(
+            leaf.ends_with("_123456.md"),
+            "expected serial suffix for truncated filename: {leaf}"
+        );
+    }
+
+    #[test]
+    fn short_case_numbers_are_not_modified_by_cap() {
+        assert_eq!(cap_filename_bytes("2024가합1", "100"), "2024가합1");
     }
 
     #[test]

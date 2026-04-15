@@ -50,8 +50,6 @@ struct Cli {
 struct PlannedEntry {
     /// Precedent serial used for file lookup and stable ordering.
     serial: String,
-    /// Original XML path used for targeted warning/error messages.
-    source_path: PathBuf,
     /// Final repository path assigned after collision handling.
     path: RepoPathBuf,
     /// Metadata collected during the cheap planning pass.
@@ -112,7 +110,6 @@ fn run(cli: Cli) -> Result<()> {
                 match parse_metadata_only(&xml, &serial) {
                     Ok(Some(metadata)) => Ok(Some(PlannedEntry {
                         serial,
-                        source_path: path.clone(),
                         path: RepoPathBuf::root_file(String::new()),
                         metadata,
                     })),
@@ -142,39 +139,12 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         //
-        // Sort by 선고일자 asc (empty -> last), then 사건번호, then serial as a numeric tiebreak.
+        // Sort by 판례일련번호 lexicographically to match Python's
+        // `sorted(PREC_CACHE_DIR.glob("*.xml"))` iteration order in
+        // `precedents/import_precedents.py`. This determines which entry wins
+        // the clean collision-free path when multiple precedents share a 사건번호.
         //
-        entries.sort_by(|left, right| {
-            let left_date: &str = if left.metadata.judgment_date.is_empty() {
-                "99991231"
-            } else {
-                left.metadata.judgment_date.as_str()
-            };
-            let right_date: &str = if right.metadata.judgment_date.is_empty() {
-                "99991231"
-            } else {
-                right.metadata.judgment_date.as_str()
-            };
-            left_date
-                .cmp(right_date)
-                .then_with(|| left.metadata.case_no.cmp(&right.metadata.case_no))
-                .then_with(|| {
-                    left.serial
-                        .parse::<u64>()
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "cache 판례일련번호 must be numeric: {}: {error:?}",
-                                left.source_path.display()
-                            )
-                        })
-                        .cmp(&right.serial.parse::<u64>().unwrap_or_else(|error| {
-                            panic!(
-                                "cache 판례일련번호 must be numeric: {}: {error:?}",
-                                right.source_path.display()
-                            )
-                        }))
-                })
-        });
+        entries.sort_by(|left, right| left.serial.cmp(&right.serial));
 
         let mut registry = PathRegistry::default();
         for entry in &mut entries {

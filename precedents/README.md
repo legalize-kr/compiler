@@ -52,6 +52,8 @@ precedent-kr-compiler ../.cache/precedent -o ./another.git
 - commit author/committer는 `legalize-kr-bot <bot@legalize.kr>`입니다.
 - commit timestamp는 선고일자 기준 KST `12:00:00`입니다.
 - `1970-01-01` 이전 날짜 및 빈 선고일자는 epoch 이전 commit을 피하기 위해 clamp합니다.
+- 업스트림이 오래된 판례의 `선고일자`를 단기(檀紀) 4자리 연도로 반환하는 경우가 있습니다(예: `42890525`). 파싱 시점에 단기 범위(4200–4330)를 서기로 변환(`CE = 단기 − 2333`)하여 정렬·타임스탬프·frontmatter가 모두 서기 기준으로 일치하도록 처리합니다. 대상 판례 목록은 생성된 저장소 `README.md`를 참고하세요.
+- **긴 파일명 capping (`NAME_MAX=255` 대응)**: 형사 병합/분리 판결은 `사건번호` 한 필드에 수십~수백 개의 사건번호를 쉼표로 나열하는 경우가 있습니다(예: `2011고합669, 743, 746, ..., 985-1 (병합) (분리)`). 그대로 파일명으로 쓰면 macOS APFS의 `NAME_MAX=255 bytes` 제한을 초과해 `git clone` 후 `checkout`이 실패합니다. `render.rs:cap_filename_bytes`가 파일명 stem(확장자 제외)을 UTF-8 기준 180바이트로 cap하고, 잘린 경우 `_{판례일련번호}`를 접미사로 붙여 고유성과 역추적성을 보존합니다. 업스트림 API가 사건번호 끝을 `....`로 잘라 보내는 경우가 있는데, 현재는 그대로 포함되므로 잘림 흔적이 파일명에 남을 수 있습니다.
 
 ## 출력 저장소 구조
 

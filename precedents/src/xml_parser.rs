@@ -128,7 +128,9 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
                         "사건명" => metadata.case_name = capture_text.clone(),
                         "법원명" => metadata.court_name = capture_text.clone(),
                         "법원종류코드" => metadata.court_code = capture_text.clone(),
-                        "선고일자" => metadata.judgment_date = capture_text.clone(),
+                        "선고일자" => {
+                            metadata.judgment_date = normalize_dangi_yyyymmdd(&capture_text);
+                        }
                         "사건종류명" => metadata.case_type_raw = capture_text.clone(),
                         _ => {}
                     }
@@ -229,6 +231,32 @@ fn decode_text(text: &[u8]) -> Result<String> {
     Ok(unescape(text)?.into_owned())
 }
 
+/// Dangi era → Gregorian offset (CE = Dangi − 2333).
+const DANGI_EPOCH_OFFSET: u32 = 2333;
+/// Dangi year floor that covers every realistic Korean legal precedent (≈1867 CE).
+const DANGI_YEAR_MIN: u32 = 4200;
+/// Dangi year ceiling (≈1997 CE); newer records are always emitted in Gregorian upstream.
+const DANGI_YEAR_MAX: u32 = 4330;
+
+/// Normalizes a `YYYYMMDD` 선고일자 so Dangi-era years become Gregorian.
+///
+/// Older upstream precedents (예: 1956년 선고) are delivered with a 4-digit 단기 연도
+/// (`42890525`) instead of 서기 (`19560525`). Converting here, at parse time, makes
+/// downstream sorting, commit timestamps, and frontmatter all agree on Gregorian.
+/// Non-Dangi inputs, blanks, and malformed strings pass through untouched.
+pub fn normalize_dangi_yyyymmdd(date: &str) -> String {
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return date.to_owned();
+    }
+    let Ok(year) = date[..4].parse::<u32>() else {
+        return date.to_owned();
+    };
+    if !(DANGI_YEAR_MIN..=DANGI_YEAR_MAX).contains(&year) {
+        return date.to_owned();
+    }
+    format!("{:04}{}", year - DANGI_EPOCH_OFFSET, &date[4..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +311,40 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn normalizes_dangi_year_in_judgment_date() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<PrecService>
+  <판례정보일련번호>232199</판례정보일련번호>
+  <사건번호><![CDATA[4289행5]]></사건번호>
+  <선고일자>42890525</선고일자>
+  <법원명>서울고법</법원명>
+  <법원종류코드>400202</법원종류코드>
+  <사건종류명>일반행정</사건종류명>
+</PrecService>"#;
+        let metadata = parse_metadata_only(xml.as_bytes(), "232199")
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.judgment_date, "19560525");
+        assert_eq!(metadata.case_no, "4289행5");
+    }
+
+    #[test]
+    fn dangi_normalization_passes_through_gregorian_dates() {
+        assert_eq!(normalize_dangi_yyyymmdd("20240101"), "20240101");
+        assert_eq!(normalize_dangi_yyyymmdd(""), "");
+        assert_eq!(normalize_dangi_yyyymmdd("abcd0101"), "abcd0101");
+        assert_eq!(normalize_dangi_yyyymmdd("00000000"), "00000000");
+    }
+
+    #[test]
+    fn dangi_normalization_boundary_years() {
+        assert_eq!(normalize_dangi_yyyymmdd("42000101"), "18670101");
+        assert_eq!(normalize_dangi_yyyymmdd("43301231"), "19971231");
+        assert_eq!(normalize_dangi_yyyymmdd("41991231"), "41991231");
+        assert_eq!(normalize_dangi_yyyymmdd("43310101"), "43310101");
     }
 
     #[test]
