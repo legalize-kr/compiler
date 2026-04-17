@@ -41,11 +41,24 @@ struct PreparedMetadata {
 pub struct PathRegistry {
     /// Already assigned paths keyed by the final repository path.
     assigned: HashMap<RepoPathBuf, String>,
+    /// Reverse index: law_id → already-assigned path for that law.
+    by_id: HashMap<String, RepoPathBuf>,
 }
 
 impl PathRegistry {
     /// Returns the Markdown path for a law name/type/id triple.
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str, law_id: &str) -> RepoPathBuf {
+        //
+        // If this law_id already has an assigned path (from an earlier revision), reuse it.
+        // This prevents the same law from getting a new qualified path for each ministry rename
+        // even when its base path is already occupied by a different law.
+        //
+        if !law_id.is_empty() {
+            if let Some(existing_path) = self.by_id.get(law_id) {
+                return existing_path.clone();
+            }
+        }
+
         //
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
         // directory instead of getting their own top-level group names.
@@ -65,7 +78,7 @@ impl PathRegistry {
         };
 
         //
-        // Reuse the plain `<group>/<filename>.md` path when the law name/type pair matches the
+        // Reuse the plain `<group>/<filename>.md` path when the law id matches the
         // previous claimant; otherwise append `(법종)` exactly like the legacy repository did.
         //
         let base = RepoPathBuf::kr_file(&group, format!("{filename}.md"));
@@ -73,15 +86,17 @@ impl PathRegistry {
             && existing_id != law_id
         {
             let qualified = RepoPathBuf::kr_file(&group, format!("{filename}({law_type}).md"));
-            self.assigned.insert(
-                qualified.clone(),
-                law_id.to_owned(),
-            );
+            self.assigned.insert(qualified.clone(), law_id.to_owned());
+            if !law_id.is_empty() {
+                self.by_id.insert(law_id.to_owned(), qualified.clone());
+            }
             return qualified;
         }
 
-        self.assigned
-            .insert(base.clone(), law_id.to_owned());
+        self.assigned.insert(base.clone(), law_id.to_owned());
+        if !law_id.is_empty() {
+            self.by_id.insert(law_id.to_owned(), base.clone());
+        }
         base
     }
 }
@@ -480,6 +495,26 @@ mod tests {
         assert_eq!(
             registry.get_law_path("테스트법 시행규칙", "행정안전부령", "ID001"),
             RepoPathBuf::kr_file("테스트법", "시행규칙.md")
+        );
+    }
+
+    #[test]
+    fn path_registry_merges_qualified_paths_for_same_law_id() {
+        let mut registry = PathRegistry::default();
+        // ID001 claims the base path
+        assert_eq!(
+            registry.get_law_path("테스트법 시행규칙", "정보통신부령", "ID001"),
+            RepoPathBuf::kr_file("테스트법", "시행규칙.md")
+        );
+        // ID002 (different law) gets a qualified path on first call
+        assert_eq!(
+            registry.get_law_path("테스트법 시행규칙", "미래창조과학부령", "ID002"),
+            RepoPathBuf::kr_file("테스트법", "시행규칙(미래창조과학부령).md")
+        );
+        // ID002 with a different ministry rename must reuse the same qualified path
+        assert_eq!(
+            registry.get_law_path("테스트법 시행규칙", "과학기술정보통신부령", "ID002"),
+            RepoPathBuf::kr_file("테스트법", "시행규칙(미래창조과학부령).md")
         );
     }
 
