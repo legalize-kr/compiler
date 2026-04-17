@@ -432,7 +432,10 @@ impl BareRepoWriter {
     }
 
     /// Finalizes the pack, writes `main` as loose refs, and moves the temporary repo into place.
-    pub fn finish(mut self) -> Result<()> {
+    ///
+    /// Returns the HEAD commit SHA of the finished repository, or `[0u8; 20]` when no commits
+    /// were ever appended.
+    pub fn finish(mut self) -> Result<[u8; 20]> {
         self.writer.finish()?;
 
         if let Some(parent_commit) = self.parent_commit {
@@ -462,7 +465,7 @@ impl BareRepoWriter {
                 self.final_output.display()
             )
         })?;
-        Ok(())
+        Ok(self.parent_commit.unwrap_or([0u8; 20]))
     }
 
     /// Commits one file change after updating blob and tree state.
@@ -1524,7 +1527,7 @@ fn hex_buf(sha: &[u8; 20]) -> [u8; 40] {
 }
 
 /// Hex-encodes one object id for refs, logging, and non-hot-path usage.
-fn hex(sha: &[u8; 20]) -> String {
+pub(crate) fn hex(sha: &[u8; 20]) -> String {
     let buf = hex_buf(sha);
     String::from_utf8(buf.to_vec()).expect("hex digits are valid UTF-8")
 }
