@@ -240,7 +240,7 @@ fn run(cli: Cli) -> Result<()> {
 
         let mut registry = PathRegistry::default();
         for entry in &mut entries {
-            entry.path = registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
+            entry.path = registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type, &entry.metadata.law_id);
         }
 
         entries
@@ -434,7 +434,7 @@ mod tests {
     const SAMPLE_XML_3: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <법령>
   <기본정보>
-    <법령ID>000003</법령ID>
+    <법령ID>000001</법령ID>
     <공포일자>20240101</공포일자>
     <공포번호>00002</공포번호>
     <법종구분>법률</법종구분>
@@ -552,7 +552,7 @@ mod tests {
             let mut registry = PathRegistry::default();
             for entry in &mut entries {
                 entry.path =
-                    registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
+                    registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type, &entry.metadata.law_id);
             }
 
             entries

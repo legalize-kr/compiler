@@ -40,12 +40,12 @@ struct PreparedMetadata {
 #[derive(Debug, Default)]
 pub struct PathRegistry {
     /// Already assigned paths keyed by the final repository path.
-    assigned: HashMap<RepoPathBuf, (String, String)>,
+    assigned: HashMap<RepoPathBuf, String>,
 }
 
 impl PathRegistry {
-    /// Returns the Markdown path for a law name/type pair.
-    pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> RepoPathBuf {
+    /// Returns the Markdown path for a law name/type/id triple.
+    pub fn get_law_path(&mut self, law_name: &str, law_type: &str, law_id: &str) -> RepoPathBuf {
         //
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
         // directory instead of getting their own top-level group names.
@@ -69,19 +69,19 @@ impl PathRegistry {
         // previous claimant; otherwise append `(법종)` exactly like the legacy repository did.
         //
         let base = RepoPathBuf::kr_file(&group, format!("{filename}.md"));
-        if let Some(existing) = self.assigned.get(&base)
-            && existing != &(law_name.to_owned(), law_type.to_owned())
+        if let Some(existing_id) = self.assigned.get(&base)
+            && existing_id != law_id
         {
             let qualified = RepoPathBuf::kr_file(&group, format!("{filename}({law_type}).md"));
             self.assigned.insert(
                 qualified.clone(),
-                (law_name.to_owned(), law_type.to_owned()),
+                law_id.to_owned(),
             );
             return qualified;
         }
 
         self.assigned
-            .insert(base.clone(), (law_name.to_owned(), law_type.to_owned()));
+            .insert(base.clone(), law_id.to_owned());
         base
     }
 }
@@ -458,13 +458,28 @@ mod tests {
     #[test]
     fn path_registry_matches_existing_collision_rule() {
         let mut registry = PathRegistry::default();
+        // Different law_ids → genuine collision → qualified path
         assert_eq!(
-            registry.get_law_path("테스트법 시행규칙", "부령"),
+            registry.get_law_path("테스트법 시행규칙", "부령", "ID001"),
             RepoPathBuf::kr_file("테스트법", "시행규칙.md")
         );
         assert_eq!(
-            registry.get_law_path("테스트법 시행규칙", "총리령"),
+            registry.get_law_path("테스트법 시행규칙", "총리령", "ID002"),
             RepoPathBuf::kr_file("테스트법", "시행규칙(총리령).md")
+        );
+    }
+
+    #[test]
+    fn path_registry_treats_ministry_rename_as_same_law() {
+        let mut registry = PathRegistry::default();
+        // Same law_id, different law_type (ministry rename) → same path
+        assert_eq!(
+            registry.get_law_path("테스트법 시행규칙", "국토교통부령", "ID001"),
+            RepoPathBuf::kr_file("테스트법", "시행규칙.md")
+        );
+        assert_eq!(
+            registry.get_law_path("테스트법 시행규칙", "행정안전부령", "ID001"),
+            RepoPathBuf::kr_file("테스트법", "시행규칙.md")
         );
     }
 
