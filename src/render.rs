@@ -104,10 +104,10 @@ impl PathRegistry {
         // This prevents the same law from getting a new qualified path for each ministry rename
         // even when its base path is already occupied by a different law.
         //
-        if !law_id.is_empty() {
-            if let Some(existing_path) = self.by_id.get(law_id) {
-                return (existing_path.clone(), kind);
-            }
+        if !law_id.is_empty()
+            && let Some(existing_path) = self.by_id.get(law_id)
+        {
+            return (existing_path.clone(), kind);
         }
 
         //

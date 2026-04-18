@@ -1113,7 +1113,7 @@ impl PackWriter {
     /// Writes the `.idx` v2 index file alongside the pack.
     fn write_idx_v2(&mut self, pack_checksum: &[u8; 20]) -> Result<()> {
         // Sort index entries by SHA.
-        self.idx_entries.sort_unstable_by(|a, b| a.sha.cmp(&b.sha));
+        self.idx_entries.sort_unstable_by_key(|a| a.sha);
 
         let idx_path = self.path.with_extension("idx");
         let mut f = BufWriter::with_capacity(4 << 20, File::create(&idx_path)?);

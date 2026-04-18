@@ -203,15 +203,11 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                     break;
                 }
             }
-            Event::Text(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&decode_text(text.as_ref())?);
-                }
+            Event::Text(text) if capture_tag.is_some() => {
+                capture_text.push_str(&decode_text(text.as_ref())?);
             }
-            Event::CData(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
+            Event::CData(text) if capture_tag.is_some() => {
+                capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
             }
             Event::End(event) => {
                 let tag = decode_name(event.name().as_ref())?;
