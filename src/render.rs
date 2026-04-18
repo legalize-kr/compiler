@@ -59,7 +59,12 @@ pub struct PathRegistry {
 
 impl PathRegistry {
     /// Returns the Markdown path and entry classification for a law name/type/id triple.
-    pub fn get_law_path(&mut self, law_name: &str, law_type: &str, law_id: &str) -> (RepoPathBuf, EntryKind) {
+    pub fn get_law_path(
+        &mut self,
+        law_name: &str,
+        law_type: &str,
+        law_id: &str,
+    ) -> (RepoPathBuf, EntryKind) {
         //
         // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
         // directory instead of getting their own top-level group names.
@@ -567,8 +572,7 @@ mod tests {
             RepoPathBuf::kr_file("테스트법", "시행규칙(미래창조과학부령).md")
         );
         // ID002 with a different ministry rename must reuse the same qualified path
-        let (path, _) =
-            registry.get_law_path("테스트법 시행규칙", "과학기술정보통신부령", "ID002");
+        let (path, _) = registry.get_law_path("테스트법 시행규칙", "과학기술정보통신부령", "ID002");
         assert_eq!(
             path,
             RepoPathBuf::kr_file("테스트법", "시행규칙(미래창조과학부령).md")

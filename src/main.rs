@@ -311,8 +311,11 @@ fn plan_and_diagnose(cache_dir: &Path) -> Result<(Vec<PlannedEntry>, Diagnostics
 
     let mut registry = PathRegistry::default();
     for entry in &mut entries {
-        let (path, kind) =
-            registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type, &entry.metadata.law_id);
+        let (path, kind) = registry.get_law_path(
+            &entry.metadata.law_name,
+            &entry.metadata.law_type,
+            &entry.metadata.law_id,
+        );
         entry.path = path;
         entry.kind = kind;
     }
