@@ -21,8 +21,12 @@ use clap::Parser;
 use rayon::prelude::*;
 
 use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
-use crate::render::{PathRegistry, build_commit_message, get_precedent_path, precedent_to_markdown};
-use crate::xml_parser::{PrecedentDetail, PrecedentMetadata, parse_metadata_only, parse_precedent_body};
+use crate::render::{
+    PathRegistry, build_commit_message, get_precedent_path, precedent_to_markdown,
+};
+use crate::xml_parser::{
+    PrecedentDetail, PrecedentMetadata, parse_metadata_only, parse_precedent_body,
+};
 
 /// Bundled README payload for the synthetic initial commit.
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
@@ -105,8 +109,8 @@ fn run(cli: Cli) -> Result<()> {
                     .and_then(|name| name.to_str())
                     .map(ToOwned::to_owned)
                     .with_context(|| format!("invalid file name: {}", path.display()))?;
-                let xml = fs::read(path)
-                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let xml =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
                 match parse_metadata_only(&xml, &serial) {
                     Ok(Some(metadata)) => Ok(Some(PlannedEntry {
                         serial,
@@ -114,10 +118,7 @@ fn run(cli: Cli) -> Result<()> {
                         metadata,
                     })),
                     Ok(None) => {
-                        eprintln!(
-                            "warning: skipping non-precedent XML {}",
-                            path.display()
-                        );
+                        eprintln!("warning: skipping non-precedent XML {}", path.display());
                         Ok(None)
                     }
                     Err(error) => {
@@ -243,8 +244,8 @@ fn run(cli: Cli) -> Result<()> {
 /// Parses, renders, and packages one planned XML entry for pass 2.
 fn render_entry(cache_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     let xml_path = cache_dir.join(format!("{}.xml", entry.serial));
-    let xml = fs::read(&xml_path)
-        .with_context(|| format!("failed to read {}", xml_path.display()))?;
+    let xml =
+        fs::read(&xml_path).with_context(|| format!("failed to read {}", xml_path.display()))?;
     let body = parse_precedent_body(&xml)
         .with_context(|| format!("failed to parse {}", xml_path.display()))?;
     let detail = PrecedentDetail {
@@ -349,7 +350,14 @@ mod tests {
 
         let tree = git_stdout(
             &output,
-            ["-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "HEAD"],
+            [
+                "-c",
+                "core.quotePath=false",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+            ],
         );
         let names: Vec<&str> = tree.lines().collect();
         assert!(names.contains(&"README.md"));

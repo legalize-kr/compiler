@@ -662,9 +662,7 @@ impl BareRepoWriter {
 
         let root_sha = if root_structure_dirty {
             self.root.cache.clear();
-            self.root
-                .file_sha_offsets
-                .resize(self.root.files.len(), 0);
+            self.root.file_sha_offsets.resize(self.root.files.len(), 0);
             self.root
                 .subtree_sha_offsets
                 .resize(self.outer.groups.len(), 0);
@@ -705,11 +703,9 @@ impl BareRepoWriter {
             });
 
             for (is_tree, name, sha, orig_idx) in &entries {
-                self.root.cache.extend_from_slice(if *is_tree {
-                    b"40000 "
-                } else {
-                    b"100644 "
-                });
+                self.root
+                    .cache
+                    .extend_from_slice(if *is_tree { b"40000 " } else { b"100644 " });
                 self.root.cache.extend_from_slice(name);
                 self.root.cache.push(0);
                 let sha_off = self.root.cache.len();
@@ -725,9 +721,7 @@ impl BareRepoWriter {
                 .write_object(PackObjectKind::Tree, &self.root.cache)?
         } else if let Some(dirty) = self.root.dirty.take() {
             let (sha_offset, new_sha) = match dirty {
-                DirtyRootEntry::File(i) => {
-                    (self.root.file_sha_offsets[i], self.root.files[i].sha)
-                }
+                DirtyRootEntry::File(i) => (self.root.file_sha_offsets[i], self.root.files[i].sha),
                 DirtyRootEntry::Subtree(i) => (
                     self.root.subtree_sha_offsets[i],
                     self.outer.groups[i]

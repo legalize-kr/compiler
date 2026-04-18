@@ -297,11 +297,7 @@ mod tests {
     #[test]
     fn returns_none_for_non_prec_service_root() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?><Law>일치하는 판례가 없습니다</Law>"#;
-        assert!(
-            parse_metadata_only(xml.as_bytes(), "1")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_metadata_only(xml.as_bytes(), "1").unwrap().is_none());
     }
 
     #[test]
