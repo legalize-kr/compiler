@@ -150,6 +150,18 @@ git log --all --grep="판례일련번호: 145683"
 
 > **원본(단기) 주의**: 일부 판례에서는 월/일 표기는 이미 서기 기준이지만 연도만 단기로 기록되어 있어 `단기 연도 − 2333 = 서기 연도` 변환 후에도 실제 선고일과 ±1년 차이가 발생할 수 있습니다(예: 판례일련번호 232143은 원본이 `4291-02-21`인데, 단기 4291년은 서기 1958년이지만 원본 1차 자료는 1957년 판결일 가능성이 있음). 정확한 실선고일은 판례 본문을 확인하세요.
 
+## 저장소 구조
+
+이 프로젝트는 여러 저장소로 구성되어 있습니다:
+
+| 저장소 | 설명 |
+|--------|------|
+| [legalize-kr/legalize-kr](https://github.com/legalize-kr/legalize-kr) | 법령 데이터 |
+| [legalize-kr/legalize-pipeline](https://github.com/legalize-kr/legalize-pipeline) | 법령·판례 수집/변환/검증 파이프라인 |
+| [legalize-kr/legalize-web](https://github.com/legalize-kr/legalize-web) | 웹사이트 ([legalize.kr](https://legalize.kr)) |
+| [legalize-kr/precedent-kr](https://github.com/legalize-kr/precedent-kr) | 판례 데이터 (현재 저장소) |
+| [legalize-kr/compiler](https://github.com/legalize-kr/compiler) | `.cache` → bare Git repo 컴파일러 (Rust) |
+
 ## 데이터 출처
 
 모든 판례 데이터는 [국가법령정보센터 OpenAPI](https://open.law.go.kr)에서 가져옵니다. 판례 원문은 대한민국 정부 공공저작물로 자유롭게 이용 가능합니다.
