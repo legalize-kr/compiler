@@ -88,7 +88,9 @@ pub fn normalize_case_type(case_type: &str) -> String {
         return case_type.replace(", ", "·").replace(',', "·");
     }
     match case_type {
-        "민사" | "형사" | "일반행정" | "세무" | "특허" | "가사" => case_type.to_owned(),
+        "민사" | "형사" | "일반행정" | "세무" | "특허" | "가사" => {
+            case_type.to_owned()
+        }
         _ => String::from("기타"),
     }
 }
@@ -153,6 +155,31 @@ fn multi_blank_re() -> &'static Regex {
     INSTANCE.get_or_init(|| Regex::new(r"\n{3,}").unwrap())
 }
 
+/// Pattern matching three or more consecutive spaces/non-breaking spaces for collapsing.
+fn multi_space_re() -> &'static Regex {
+    static INSTANCE: OnceLock<Regex> = OnceLock::new();
+    INSTANCE.get_or_init(|| Regex::new(r"[ \u{00A0}]{3,}").unwrap())
+}
+
+/// Inline whitespace normalization for 사건명 (frontmatter + H1 title).
+///
+/// Converts `<br>` to a single space (keeps the name single-line), strips
+/// remaining tags, decodes HTML entities, and collapses 3+ space/NBSP runs.
+pub fn normalize_case_name(text: &str) -> String {
+    let with_spaces = br_re().replace_all(text, " ").into_owned();
+    let stripped = html_tag_re().replace_all(&with_spaces, "").into_owned();
+    let decoded = stripped
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    let spaced = multi_space_re().replace_all(&decoded, " ").into_owned();
+    spaced.trim().to_owned()
+}
+
 /// Converts an HTML-bearing precedent section into plain Markdown text.
 pub fn html_to_markdown(html: &str) -> String {
     let with_newlines = br_re().replace_all(html, "\n").into_owned();
@@ -166,7 +193,8 @@ pub fn html_to_markdown(html: &str) -> String {
         .replace("&#39;", "'")
         .replace("&nbsp;", " ");
     let collapsed = multi_blank_re().replace_all(&decoded, "\n\n").into_owned();
-    collapsed.trim().to_owned()
+    let spaced = multi_space_re().replace_all(&collapsed, " ").into_owned();
+    spaced.trim().to_owned()
 }
 
 /// Converts a `YYYYMMDD` 선고일자 to `YYYY-MM-DD`, returning `None` for sentinel values.
@@ -188,17 +216,15 @@ pub fn format_judgment_date(date_str: &str) -> Option<String> {
 
 /// Renders one parsed precedent document into the repository Markdown format.
 pub fn precedent_to_markdown(detail: &PrecedentDetail) -> Result<Vec<u8>> {
+    let case_name = normalize_case_name(&detail.metadata.case_name);
     let frontmatter = Frontmatter {
         serial: &detail.metadata.serial,
         case_no: &detail.metadata.case_no,
-        case_name: &detail.metadata.case_name,
+        case_name: &case_name,
         court_name: normalize_court_name(&detail.metadata.court_name),
         court_tier: court_tier_label(&detail.metadata.court_code),
         case_type: normalize_case_type(&detail.metadata.case_type_raw),
-        source: format!(
-            "https://www.law.go.kr/판례/{}",
-            detail.metadata.serial
-        ),
+        source: format!("https://www.law.go.kr/판례/{}", detail.metadata.serial),
         judgment_date: format_judgment_date(&detail.metadata.judgment_date),
     };
     let mut yaml = serde_yaml::to_string(&frontmatter)?;
@@ -206,8 +232,8 @@ pub fn precedent_to_markdown(detail: &PrecedentDetail) -> Result<Vec<u8>> {
         yaml = stripped.to_owned();
     }
 
-    let title = if !detail.metadata.case_name.is_empty() {
-        detail.metadata.case_name.as_str()
+    let title = if !case_name.is_empty() {
+        case_name.as_str()
     } else if !detail.metadata.case_no.is_empty() {
         detail.metadata.case_no.as_str()
     } else {
@@ -318,10 +344,7 @@ mod tests {
     #[test]
     fn sanitizes_case_numbers() {
         assert_eq!(sanitize_case_number("(창원)2024가합1234"), "2024가합1234");
-        assert_eq!(
-            sanitize_case_number("2000므1257, 1264"),
-            "2000므1257_1264"
-        );
+        assert_eq!(sanitize_case_number("2000므1257, 1264"), "2000므1257_1264");
         assert_eq!(
             sanitize_case_number("2000므1257(본소), 1264(반소)"),
             "2000므1257_본소_1264_반소"
@@ -358,10 +381,7 @@ mod tests {
     #[test]
     fn long_merged_case_numbers_are_capped_within_name_max() {
         let many_numbers: Vec<String> = (700..1000).map(|n| n.to_string()).collect();
-        let long_case = format!(
-            "2011고합669, {} (병합) (분리)",
-            many_numbers.join(", ")
-        );
+        let long_case = format!("2011고합669, {} (병합) (분리)", many_numbers.join(", "));
         let mut registry = PathRegistry::default();
         let path = get_precedent_path(
             &PrecedentMetadata {
@@ -394,7 +414,10 @@ mod tests {
 
     #[test]
     fn format_judgment_date_rejects_sentinels() {
-        assert_eq!(format_judgment_date("20240101").as_deref(), Some("2024-01-01"));
+        assert_eq!(
+            format_judgment_date("20240101").as_deref(),
+            Some("2024-01-01")
+        );
         assert_eq!(format_judgment_date(""), None);
         assert_eq!(format_judgment_date("00000101"), None);
         assert_eq!(format_judgment_date("0001-01"), None);
@@ -428,5 +451,18 @@ mod tests {
         assert!(markdown.contains("## 판시사항"));
         assert!(markdown.contains("판시 본문"));
         assert!(!markdown.contains("## 참조조문"));
+    }
+
+    #[test]
+    fn multi_space_collapses_three_or_more_spaces() {
+        assert_eq!(html_to_markdown("a   b"), "a b");
+        assert_eq!(html_to_markdown("a  b"), "a  b");
+        assert_eq!(html_to_markdown("a\u{00A0}\u{00A0}\u{00A0}b"), "a b");
+        assert_eq!(html_to_markdown("a     b\nc   d"), "a b\nc d");
+    }
+
+    #[test]
+    fn nbsp_decoded_then_space_collapsed() {
+        assert_eq!(html_to_markdown("a&nbsp;&nbsp;&nbsp;b"), "a b");
     }
 }
