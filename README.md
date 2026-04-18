@@ -40,7 +40,22 @@ legalize-kr-compiler ../.cache -o ./another.git
    - `법령명 asc`
    - `공포번호 asc (numeric)`
    - `MST asc (numeric)`
+
+   이 4-튜플 순서는 [legalize-pipeline]의 `laws.converter.entry_sort_key`와
+   동일하게 맞춰져 있습니다. Python 재구현이 동일한 canonical 파일을 고르도록
+   하려면 양쪽을 같이 바꿔야 합니다. 직접 영향을 받는 Python 호출 지점:
+   `laws/rebuild.py`, `laws/import_laws.py` (API/cache/CSV 모드),
+   `laws/update.py`.
 4. 경로 충돌 규칙을 적용해 출력 파일 경로를 확정합니다.
+   - 같은 structural path를 두 개 이상의 `법령ID`가 공유할 때만 qualified
+     suffix(`법률(법률).md`)가 붙습니다.
+   - 정렬 결과 **먼저 오는 entry가 canonical(`법률.md`)**이 되는 first-write-wins.
+     이 때문에 (3)의 4-튜플 정렬이 canonical 경로 선택의 tiebreaker가 됩니다.
+     정렬 키가 달라지면 canonical/qualified 배정이 뒤집혀 git history의
+     `법률.md` 연혁이 끊길 수 있으므로, Python과 Rust의 정렬 키는
+     반드시 일치해야 합니다.
+
+[legalize-pipeline]: https://github.com/legalize-kr/legalize-pipeline
 5. 정렬된 순서대로 XML 본문만 다시 파싱해 Markdown과 commit message를 만들고 commit을 작성합니다.
    - 이 단계는 chunk 단위로 병렬 render를 수행하면서, main thread는 순서대로 commit만 씁니다.
 
