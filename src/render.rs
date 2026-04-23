@@ -305,6 +305,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
         //
         for article in &detail.articles {
             let number = &article.number;
+            let branch_number = &article.branch_number;
             let title = &article.title;
             let content = normalize_law_name(article.content.trim());
 
@@ -326,6 +327,9 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
             }
 
             let mut heading = format!("##### 제{number}조");
+            if !branch_number.is_empty() {
+                heading.push_str(&format!("의{branch_number}"));
+            }
             if !title.is_empty() {
                 heading.push_str(&format!(" ({title})"));
             }
@@ -595,6 +599,7 @@ mod tests {
             },
             articles: vec![Article {
                 number: String::from("1"),
+                branch_number: String::new(),
                 title: String::from("정의"),
                 content: String::from("제1조 (정의) 본문"),
                 paragraphs: vec![Paragraph {

@@ -66,6 +66,8 @@ pub struct Paragraph {
 pub struct Article {
     /// Article number without the `조` suffix.
     pub number: String,
+    /// Article branch number (`조문가지번호`) for articles like `제52조의2`. Empty when absent.
+    pub branch_number: String,
     /// Optional article title.
     pub title: String,
     /// Leading article text before numbered paragraphs.
@@ -315,6 +317,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
     for node in article_nodes {
         let mut article = Article {
             number: node.child_text("조문번호"),
+            branch_number: node.child_text("조문가지번호"),
             title: node.child_text("조문제목"),
             content: node.child_text("조문내용"),
             paragraphs: Vec::new(),
