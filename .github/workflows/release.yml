@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths-ignore:
       - "README.md"
+      - "laws/README.md"
+      - "precedents/README.md"
 
 jobs:
   release:
@@ -23,16 +25,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cargo zigbuild --no-default-features -r --target x86_64-unknown-linux-musl
-          cargo zigbuild --no-default-features -r --target aarch64-unknown-linux-musl
-          cargo zigbuild --no-default-features -r --target universal2-apple-darwin
-          mv target/aarch64-unknown-linux-musl/release/legalize-kr-compiler legalize-kr-compiler-aarch64-unknown-linux-musl
-          mv target/x86_64-unknown-linux-musl/release/legalize-kr-compiler legalize-kr-compiler-x86_64-unknown-linux-musl
-          mv target/universal2-apple-darwin/release/legalize-kr-compiler legalize-kr-compiler-universal2-apple-darwin
+          cargo zigbuild --workspace --no-default-features -r --target x86_64-unknown-linux-musl
+          cargo zigbuild --workspace --no-default-features -r --target aarch64-unknown-linux-musl
+          cargo zigbuild --workspace --no-default-features -r --target universal2-apple-darwin
+
+          # 두 바이너리 × 3 타겟 = 6 자산. 파일명은 통합 이전과 동일하게 보존하여
+          # legalize-pipeline/full-laws-import.yml 등 다운스트림 호출자가 변경 없이 동작.
+          for bin in legalize-kr-compiler precedent-kr-compiler; do
+            mv "target/aarch64-unknown-linux-musl/release/${bin}" "${bin}-aarch64-unknown-linux-musl"
+            mv "target/x86_64-unknown-linux-musl/release/${bin}" "${bin}-x86_64-unknown-linux-musl"
+            mv "target/universal2-apple-darwin/release/${bin}" "${bin}-universal2-apple-darwin"
+          done
+
           tar -cvf binaries.tar \
             legalize-kr-compiler-aarch64-unknown-linux-musl \
             legalize-kr-compiler-x86_64-unknown-linux-musl \
-            legalize-kr-compiler-universal2-apple-darwin
+            legalize-kr-compiler-universal2-apple-darwin \
+            precedent-kr-compiler-aarch64-unknown-linux-musl \
+            precedent-kr-compiler-x86_64-unknown-linux-musl \
+            precedent-kr-compiler-universal2-apple-darwin
 
           VERSION="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           TAG="${VERSION}-$(date -u +%Y%m%d%H%M%S)"
@@ -41,4 +52,7 @@ jobs:
           gh release create "$TAG" --title "$TAG" --generate-notes \
             legalize-kr-compiler-aarch64-unknown-linux-musl \
             legalize-kr-compiler-x86_64-unknown-linux-musl \
-            legalize-kr-compiler-universal2-apple-darwin
+            legalize-kr-compiler-universal2-apple-darwin \
+            precedent-kr-compiler-aarch64-unknown-linux-musl \
+            precedent-kr-compiler-x86_64-unknown-linux-musl \
+            precedent-kr-compiler-universal2-apple-darwin

@@ -13,7 +13,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
-      - run: cargo clippy --no-deps -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --no-deps -- -D warnings
       - run: cargo shear
-      - run: cargo fmt -- --check
+      - run: cargo fmt --all -- --check
