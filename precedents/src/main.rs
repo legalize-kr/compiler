@@ -22,7 +22,8 @@ use rayon::prelude::*;
 
 use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
 use crate::render::{
-    PathRegistry, build_commit_message, get_precedent_path, precedent_to_markdown,
+    PathRegistry, build_commit_message, get_precedent_path, legacy_get_precedent_path,
+    precedent_to_markdown,
 };
 use crate::xml_parser::{
     PrecedentDetail, PrecedentMetadata, parse_metadata_only, parse_precedent_body,
@@ -47,6 +48,18 @@ struct Cli {
     /// Output bare repository path.
     #[arg(short = 'o', long = "output", default_value = "output.git")]
     output: PathBuf,
+
+    /// Optional path to write a `legacy-paths.json` mapping the legacy single-key
+    /// precedent-kr filenames to the new composite-key filenames. Used by Phase 4
+    /// diff harness, cli-tools fallback lookup, and legalize-web redirect table.
+    #[arg(long = "emit-legacy-paths")]
+    emit_legacy_paths: Option<PathBuf>,
+
+    /// Optional path to the existing `precedent-kr` working tree. When provided,
+    /// records whose computed legacy `old_path` does NOT exist in this tree get
+    /// `old_path: null` in the emission (per plan §3 Phase 3 schema).
+    #[arg(long = "legacy-precedent-root")]
+    legacy_precedent_root: Option<PathBuf>,
 }
 
 /// Pass-1 planning record for one XML document.
@@ -56,6 +69,9 @@ struct PlannedEntry {
     serial: String,
     /// Final repository path assigned after collision handling.
     path: RepoPathBuf,
+    /// Legacy single-key path that this precedent occupies in the existing
+    /// `precedent-kr` repo (used only for `--emit-legacy-paths`).
+    legacy_path: RepoPathBuf,
     /// Metadata collected during the cheap planning pass.
     metadata: PrecedentMetadata,
 }
@@ -115,6 +131,7 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(Some(metadata)) => Ok(Some(PlannedEntry {
                         serial,
                         path: RepoPathBuf::root_file(String::new()),
+                        legacy_path: RepoPathBuf::root_file(String::new()),
                         metadata,
                     })),
                     Ok(None) => {
@@ -148,9 +165,25 @@ fn run(cli: Cli) -> Result<()> {
         entries.sort_by(|left, right| left.serial.cmp(&right.serial));
 
         let mut registry = PathRegistry::default();
+        let mut legacy_registry = PathRegistry::default();
         for entry in &mut entries {
             entry.path = get_precedent_path(&entry.metadata, &mut registry);
+            entry.legacy_path = legacy_get_precedent_path(&entry.metadata, &mut legacy_registry);
         }
+
+        //
+        // Re-sort by 선고일자 ASC (with serial as a stable tiebreak) so the commit
+        // graph follows chronological order. The serial sort above is preserved as
+        // the *collision-resolution* order; this re-sort only affects the order in
+        // which precedents are appended to the commit chain. Empty/sentinel dates
+        // sort first (clamp to git epoch in pass 2), matching the laws pipeline.
+        //
+        entries.sort_by(|left, right| {
+            left.metadata
+                .judgment_date
+                .cmp(&right.metadata.judgment_date)
+                .then_with(|| left.serial.cmp(&right.serial))
+        });
 
         entries
     };
@@ -238,6 +271,73 @@ fn run(cli: Cli) -> Result<()> {
 
     eprintln!("3. Finalizing pack + index");
     repo.finish()?;
+
+    if let Some(emit_path) = cli.emit_legacy_paths.as_ref() {
+        write_legacy_paths_json(emit_path, &entries, cli.legacy_precedent_root.as_deref())?;
+    }
+
+    Ok(())
+}
+
+/// JSON entry written to `legacy-paths.json` (see plan §3 Phase 3 schema).
+#[derive(Debug, serde::Serialize)]
+struct LegacyPathEntry<'a> {
+    /// 판례일련번호 — primary join key for cli-tools / web redirect lookup.
+    #[serde(rename = "판례일련번호")]
+    serial: &'a str,
+    /// Path of the existing precedent-kr file, or `null` for newly added records
+    /// (when `--legacy-precedent-root` was passed and the legacy file is absent).
+    old_path: Option<String>,
+    /// Path of the corresponding file in the new bare repo.
+    new_path: String,
+}
+
+/// Writes the `legacy-paths.json` mapping required by Phase 4 diff harness,
+/// cli-tools fallback lookup, and legalize-web redirect generation.
+///
+/// All string values are NFC-normalized; entries are sorted by `판례일련번호` ASC
+/// (string compare). When `precedent_root` is provided, records whose computed
+/// `old_path` doesn't exist on disk get `old_path: null`.
+fn write_legacy_paths_json(
+    output: &Path,
+    entries: &[PlannedEntry],
+    precedent_root: Option<&Path>,
+) -> Result<()> {
+    use unicode_normalization::UnicodeNormalization;
+
+    let mut sorted: Vec<&PlannedEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.serial.cmp(&b.serial));
+
+    let mut payload: Vec<LegacyPathEntry<'_>> = Vec::with_capacity(sorted.len());
+    for entry in &sorted {
+        let new_path: String = entry.path.to_string().nfc().collect();
+        let legacy_str: String = entry.legacy_path.to_string().nfc().collect();
+        let old_path = match precedent_root {
+            Some(root) => {
+                if root.join(&legacy_str).exists() {
+                    Some(legacy_str)
+                } else {
+                    None
+                }
+            }
+            None => Some(legacy_str),
+        };
+        payload.push(LegacyPathEntry {
+            serial: entry.serial.as_str(),
+            old_path,
+            new_path,
+        });
+    }
+
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .with_context(|| format!("serialize legacy-paths.json for {}", output.display()))?;
+    fs::write(output, bytes)
+        .with_context(|| format!("write legacy-paths.json to {}", output.display()))?;
+    eprintln!(
+        "  wrote legacy-paths.json with {} entries to {}",
+        payload.len(),
+        output.display()
+    );
     Ok(())
 }
 
@@ -336,6 +436,8 @@ mod tests {
         run(Cli {
             cache_dir: cache_dir.clone(),
             output: output.clone(),
+            emit_legacy_paths: None,
+            legacy_precedent_root: None,
         })
         .unwrap();
 
@@ -361,10 +463,13 @@ mod tests {
         );
         let names: Vec<&str> = tree.lines().collect();
         assert!(names.contains(&"README.md"));
-        assert!(names.contains(&"민사/대법원/2024가합1.md"));
-        assert!(names.contains(&"형사/하급심/2024도1.md"));
+        assert!(names.contains(&"민사/대법원/대법원--2024-01-01--2024가합1.md"));
+        assert!(names.contains(&"형사/하급심/서울고등법원--2024-02-01--2024도1.md"));
 
-        let markdown = git_stdout(&output, ["show", "HEAD:민사/대법원/2024가합1.md"]);
+        let markdown = git_stdout(
+            &output,
+            ["show", "HEAD:민사/대법원/대법원--2024-01-01--2024가합1.md"],
+        );
         assert!(markdown.contains("판례일련번호: '1001'"));
         assert!(markdown.contains("# 손해배상"));
         assert!(markdown.contains("## 판시사항"));

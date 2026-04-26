@@ -6,9 +6,21 @@ use anyhow::Result;
 use regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::git_repo::RepoPathBuf;
-use crate::xml_parser::{PrecedentDetail, PrecedentMetadata};
+use crate::xml_parser::{
+    MISSING_COURT_SENTINEL, MISSING_DATE_SENTINEL, PrecedentDetail, PrecedentMetadata,
+};
+
+/// Slot separator for the composite filename grammar `{COURT}{SEP}{DATE}{SEP}{CASENO}`.
+///
+/// Kept as a single source of truth so the SEP swap is a one-line change, and must stay
+/// in lockstep with the Python (`legalize-pipeline`) and cli-tools sides. Per plan
+/// §1.1.1's preflight (7) gate, `__` and `~` were both rejected (real cases like
+/// `(제주)2008나56(본소),(제주)2008나63(반소)` sanitize to `..._본소__제주...` which
+/// would collide with `__` SEP), so the cascade landed on `--` (double hyphen).
+pub const SEP: &str = "--";
 
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
 #[derive(Debug, Default)]
@@ -24,20 +36,20 @@ pub fn get_precedent_path(
 ) -> RepoPathBuf {
     let case_type = normalize_case_type(&metadata.case_type_raw);
     let court_tier = court_tier_label(&metadata.court_code);
-    let raw_case_no = metadata.case_no.trim();
-    let filename = if raw_case_no.is_empty() {
-        metadata.serial.clone()
-    } else {
-        cap_filename_bytes(&sanitize_case_number(raw_case_no), &metadata.serial)
-    };
+    let stem = compose_filename_stem(
+        &metadata.court_name,
+        &metadata.judgment_date,
+        &metadata.case_no,
+        &metadata.serial,
+    );
 
-    let base_filename = format!("{filename}.md");
+    let base_filename = format!("{stem}.md");
     let base_path = RepoPathBuf::prec_file(&case_type, &court_tier, &base_filename);
     let base_key = base_path.to_string();
 
     let final_path = match registry.assigned.get(&base_key) {
         Some(existing) if existing != &metadata.serial => {
-            let qualified_filename = format!("{filename}_{}.md", metadata.serial);
+            let qualified_filename = format!("{stem}_{}.md", metadata.serial);
             RepoPathBuf::prec_file(&case_type, &court_tier, &qualified_filename)
         }
         _ => base_path,
@@ -47,6 +59,67 @@ pub fn get_precedent_path(
         .assigned
         .insert(final_path.to_string(), metadata.serial.clone());
     final_path
+}
+
+/// Composes the filename stem `{COURT}{SEP}{DATE}{SEP}{CASENO}` for one precedent.
+///
+/// Mirrors `legalize-pipeline/precedents/converter.py:compose_filename_stem` byte-for-byte.
+///
+/// Missing-value policy (see plan §1.4):
+/// - Empty/sentinel `judgment_date` → `0000-00-00` so the grammar slot survives.
+/// - Empty `court_name` → `미상법원` AND CASENO is forced to `serial` (since the
+///   composite key would otherwise lose its discriminator).
+/// - Empty `case_no` → `serial` fallback (legacy behavior).
+///
+/// All path components are NFC-normalized after normalization. The final stem is
+/// capped to `MAX_FILENAME_STEM_BYTES` via `cap_caseno_slot`, which trims only the
+/// CASENO slot so both SEP slots survive.
+pub fn compose_filename_stem(
+    court_name: &str,
+    judgment_date: &str,
+    case_no: &str,
+    serial: &str,
+) -> String {
+    let normalized_court = normalize_court_name(court_name.trim());
+    let court_nfc: String = normalized_court.nfc().collect();
+    let (court, force_serial_caseno) = if court_nfc.is_empty() {
+        (MISSING_COURT_SENTINEL.to_owned(), true)
+    } else {
+        (court_nfc, false)
+    };
+
+    let date =
+        format_judgment_date(judgment_date).unwrap_or_else(|| MISSING_DATE_SENTINEL.to_owned());
+
+    let caseno_raw = case_no.trim();
+    let caseno = if caseno_raw.is_empty() || force_serial_caseno {
+        serial.nfc().collect::<String>()
+    } else {
+        sanitize_case_number(caseno_raw).nfc().collect::<String>()
+    };
+
+    cap_caseno_slot(&court, &date, &caseno, serial)
+}
+
+/// Caps the composite stem to `MAX_FILENAME_STEM_BYTES`, trimming the CASENO slot only.
+///
+/// `_{serial}` suffix matches the legacy `cap_filename_bytes` policy so collision
+/// resolution stays uniform.
+pub fn cap_caseno_slot(court: &str, date: &str, caseno: &str, serial: &str) -> String {
+    let stem = format!("{court}{SEP}{date}{SEP}{caseno}");
+    if stem.len() <= MAX_FILENAME_STEM_BYTES {
+        return stem;
+    }
+    let prefix = format!("{court}{SEP}{date}{SEP}");
+    let suffix = format!("_{serial}");
+    let keep = MAX_FILENAME_STEM_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix.len());
+    let mut end = keep.min(caseno.len());
+    while end > 0 && !caseno.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{prefix}{}{suffix}", &caseno[..end])
 }
 
 /// Court abbreviation expansion patterns kept in priority order.
@@ -112,19 +185,26 @@ pub fn sanitize_case_number(case_no: &str) -> String {
     let trimmed = case_no.trim();
     let stripped_leading = leading_parens_re().replace(trimmed, "").into_owned();
     let comma_normalized = stripped_leading.replace(", ", "_").replace(',', "_");
-    remaining_parens_re()
+    let result = remaining_parens_re()
         .replace_all(&comma_normalized, "_$1")
-        .into_owned()
+        .into_owned();
+    // Runtime guard: SEP must never appear in sanitize output, otherwise the composite
+    // filename grammar `{COURT}{SEP}{DATE}{SEP}{CASENO}` becomes ambiguous.
+    debug_assert!(
+        !result.contains(SEP),
+        "sanitize_case_number produced SEP `{SEP}` in {result:?} (input: {case_no:?})",
+    );
+    result
 }
 
 /// Maximum byte length for a filename stem (leaves headroom for `.md` and the
 /// collision `_{serial}` suffix within the 255-byte `NAME_MAX` limit on APFS).
 const MAX_FILENAME_STEM_BYTES: usize = 180;
 
-/// Caps a filename stem to `MAX_FILENAME_STEM_BYTES` bytes, appending
-/// `_{serial}` when truncation occurs so the resulting path stays unique and
-/// traceable back to the source precedent.
-pub fn cap_filename_bytes(filename: &str, serial: &str) -> String {
+/// Legacy single-key cap (pre-Phase-1 behavior): caps `filename` to MAX bytes and
+/// appends `_{serial}` on truncation. Kept for `legacy_get_precedent_path` so
+/// `legacy-paths.json` emission can map old precedent-kr files exactly.
+fn legacy_cap_filename_bytes(filename: &str, serial: &str) -> String {
     if filename.len() <= MAX_FILENAME_STEM_BYTES {
         return filename.to_owned();
     }
@@ -135,6 +215,41 @@ pub fn cap_filename_bytes(filename: &str, serial: &str) -> String {
         end -= 1;
     }
     format!("{}{}", &filename[..end], suffix)
+}
+
+/// Legacy single-key path resolver — mirrors the pre-rename `precedent-kr` filenames.
+///
+/// Used only by Phase 3 `legacy-paths.json` emission to map current files in the
+/// `precedent-kr` baseline to their composite-key successors.
+pub fn legacy_get_precedent_path(
+    metadata: &PrecedentMetadata,
+    registry: &mut PathRegistry,
+) -> RepoPathBuf {
+    let case_type = normalize_case_type(&metadata.case_type_raw);
+    let court_tier = court_tier_label(&metadata.court_code);
+    let raw_case_no = metadata.case_no.trim();
+    let filename = if raw_case_no.is_empty() {
+        metadata.serial.clone()
+    } else {
+        legacy_cap_filename_bytes(&sanitize_case_number(raw_case_no), &metadata.serial)
+    };
+
+    let base_filename = format!("{filename}.md");
+    let base_path = RepoPathBuf::prec_file(&case_type, &court_tier, &base_filename);
+    let base_key = base_path.to_string();
+
+    let final_path = match registry.assigned.get(&base_key) {
+        Some(existing) if existing != &metadata.serial => {
+            let qualified_filename = format!("{filename}_{}.md", metadata.serial);
+            RepoPathBuf::prec_file(&case_type, &court_tier, &qualified_filename)
+        }
+        _ => base_path,
+    };
+
+    registry
+        .assigned
+        .insert(final_path.to_string(), metadata.serial.clone());
+    final_path
 }
 
 /// Pattern matching `<br>` and `<br/>` tags during HTML stripping.
@@ -224,7 +339,10 @@ pub fn precedent_to_markdown(detail: &PrecedentDetail) -> Result<Vec<u8>> {
         court_name: normalize_court_name(&detail.metadata.court_name),
         court_tier: court_tier_label(&detail.metadata.court_code),
         case_type: normalize_case_type(&detail.metadata.case_type_raw),
-        source: format!("https://www.law.go.kr/판례/{}", detail.metadata.serial),
+        source: format!(
+            "https://www.law.go.kr/LSW/precInfoP.do?precSeq={}",
+            detail.metadata.serial
+        ),
         judgment_date: format_judgment_date(&detail.metadata.judgment_date),
     };
     let mut yaml = serde_yaml::to_string(&frontmatter)?;
@@ -279,7 +397,7 @@ pub fn build_commit_message(metadata: &PrecedentMetadata) -> String {
     lines.push(title);
     lines.push(String::new());
     lines.push(format!(
-        "판례: https://www.law.go.kr/판례/({})",
+        "판례: https://www.law.go.kr/LSW/precInfoP.do?precSeq={}",
         metadata.serial
     ));
     lines.push(format!("선고일자: {date_line}"));
@@ -352,13 +470,81 @@ mod tests {
     }
 
     #[test]
+    fn compose_filename_stem_happy_path() {
+        let stem = compose_filename_stem("대법원", "20030310", "2002다56116", "100");
+        assert_eq!(stem, "대법원--2003-03-10--2002다56116");
+    }
+
+    #[test]
+    fn compose_filename_stem_handles_merged_case_no() {
+        let stem = compose_filename_stem(
+            "대법원",
+            "20031114",
+            "2000므1257(본소), 1264(반소)",
+            "145683",
+        );
+        assert_eq!(stem, "대법원--2003-11-14--2000므1257_본소_1264_반소");
+    }
+
+    #[test]
+    fn compose_filename_stem_missing_date_uses_sentinel() {
+        let stem = compose_filename_stem("대법원", "", "2024가합1", "100");
+        assert_eq!(stem, "대법원--0000-00-00--2024가합1");
+        let stem = compose_filename_stem("대법원", "00000000", "2024가합1", "100");
+        assert_eq!(stem, "대법원--0000-00-00--2024가합1");
+    }
+
+    #[test]
+    fn compose_filename_stem_missing_court_falls_back_to_serial() {
+        // Empty court → "미상법원" + CASENO forced to serial.
+        let stem = compose_filename_stem("", "20240101", "2024가합1", "999");
+        assert_eq!(stem, "미상법원--2024-01-01--999");
+    }
+
+    #[test]
+    fn compose_filename_stem_caps_only_caseno_slot() {
+        let many: Vec<String> = (700..1000).map(|n| n.to_string()).collect();
+        let long_case = format!("2011고합669, {} (병합) (분리)", many.join(", "));
+        let stem = compose_filename_stem("대법원", "20110315", &long_case, "123456");
+        assert!(
+            stem.len() <= MAX_FILENAME_STEM_BYTES,
+            "stem must fit MAX_FILENAME_STEM_BYTES: {} bytes",
+            stem.len()
+        );
+        assert!(
+            stem.starts_with("대법원--2011-03-15--"),
+            "court+date prefix preserved: {stem}"
+        );
+        assert!(
+            stem.ends_with("_123456"),
+            "serial suffix appended on truncation: {stem}"
+        );
+    }
+
+    #[test]
+    fn compose_filename_stem_normalizes_to_nfc() {
+        // Decomposed Hangul (NFD): 가 = U+1100 U+1161, expect NFC-composed 가 in output.
+        let nfd_court = "\u{1103}\u{1162}\u{1107}\u{1165}\u{11B8}\u{110B}\u{116F}\u{11AB}"; // 대법원
+        let stem = compose_filename_stem(nfd_court, "20240101", "2024가합1", "100");
+        assert_eq!(stem, "대법원--2024-01-01--2024가합1");
+        // Stem is in NFC: per-char count matches NFC form.
+        assert_eq!(
+            stem.chars().count(),
+            "대법원--2024-01-01--2024가합1".chars().count()
+        );
+    }
+
+    #[test]
     fn collisions_get_serial_suffix() {
+        // Composite key collision: same court+date+caseno, different serials.
         let mut registry = PathRegistry::default();
         let first = get_precedent_path(
             &PrecedentMetadata {
                 serial: String::from("100"),
                 case_no: String::from("2024가합1"),
+                court_name: String::from("대법원"),
                 court_code: String::from("400201"),
+                judgment_date: String::from("20240101"),
                 case_type_raw: String::from("민사"),
                 ..PrecedentMetadata::default()
             },
@@ -368,14 +554,40 @@ mod tests {
             &PrecedentMetadata {
                 serial: String::from("200"),
                 case_no: String::from("2024가합1"),
+                court_name: String::from("대법원"),
                 court_code: String::from("400201"),
+                judgment_date: String::from("20240101"),
                 case_type_raw: String::from("민사"),
                 ..PrecedentMetadata::default()
             },
             &mut registry,
         );
-        assert_eq!(first.to_string(), "민사/대법원/2024가합1.md");
-        assert_eq!(second.to_string(), "민사/대법원/2024가합1_200.md");
+        assert_eq!(
+            first.to_string(),
+            "민사/대법원/대법원--2024-01-01--2024가합1.md"
+        );
+        assert_eq!(
+            second.to_string(),
+            "민사/대법원/대법원--2024-01-01--2024가합1_200.md"
+        );
+    }
+
+    #[test]
+    fn sanitize_case_number_never_emits_sep() {
+        // Regression guard: SEP must not appear inside sanitize output.
+        for input in [
+            "(창원)2024가합1234",
+            "2000므1257, 1264",
+            "2000므1257(본소), 1264(반소)",
+            "2011고합669, 700, 701, 702 (병합) (분리)",
+            "2024가합1",
+        ] {
+            let s = sanitize_case_number(input);
+            assert!(
+                !s.contains(SEP),
+                "SEP `{SEP}` leaked into {s:?} from {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -387,7 +599,9 @@ mod tests {
             &PrecedentMetadata {
                 serial: String::from("123456"),
                 case_no: long_case,
+                court_name: String::from("부산지방법원"),
                 court_code: String::from("400202"),
+                judgment_date: String::from("20110315"),
                 case_type_raw: String::from("형사"),
                 ..PrecedentMetadata::default()
             },
@@ -405,11 +619,6 @@ mod tests {
             leaf.ends_with("_123456.md"),
             "expected serial suffix for truncated filename: {leaf}"
         );
-    }
-
-    #[test]
-    fn short_case_numbers_are_not_modified_by_cap() {
-        assert_eq!(cap_filename_bytes("2024가합1", "100"), "2024가합1");
     }
 
     #[test]

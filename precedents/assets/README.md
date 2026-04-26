@@ -71,7 +71,7 @@ git log --all --grep="판례일련번호: 145683"
 법원명: 대법원
 법원등급: 대법원
 사건종류: 가사
-출처: https://www.law.go.kr/판례/145683
+출처: https://www.law.go.kr/LSW/precInfoP.do?precSeq=145683
 선고일자: '2003-11-14'
 ---
 
@@ -113,7 +113,7 @@ git log --all --grep="판례일련번호: 145683"
 ```
 판례: 손해배상(사실혼파기)·손해배상(사실혼파기)
 
-판례: https://www.law.go.kr/판례/(145683)
+판례: https://www.law.go.kr/LSW/precInfoP.do?precSeq=145683
 선고일자: 2003-11-14
 법원명: 대법원
 사건종류: 가사

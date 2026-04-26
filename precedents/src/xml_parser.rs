@@ -5,6 +5,18 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
+/// Sentinel filled into the composite filename when 선고일자 is missing or invalid.
+///
+/// Frontmatter still omits the `선고일자` key in that case (see `render.rs:Frontmatter`);
+/// this sentinel only protects the filename grammar slot from collapsing.
+pub const MISSING_DATE_SENTINEL: &str = "0000-00-00";
+
+/// Sentinel filled into the composite filename when 법원명 is missing.
+///
+/// When this branch fires, `compose_filename_stem` also forces CASENO to `serial`
+/// because a composite key without a real court has lost its discriminator.
+pub const MISSING_COURT_SENTINEL: &str = "미상법원";
+
 /// Metadata extracted from one `PrecService` XML document.
 #[derive(Debug, Clone, Default)]
 pub struct PrecedentMetadata {
