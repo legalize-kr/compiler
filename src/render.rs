@@ -682,10 +682,22 @@ mod tests {
         };
 
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
-        assert!(markdown.contains("##### 제4조의2 (가지조)"), "article heading missing 의2: {markdown}");
-        assert!(markdown.contains("**①의3**"), "paragraph prefix missing 의3: {markdown}");
-        assert!(markdown.contains("  1의2\\. 가지호"), "subparagraph prefix missing 의2: {markdown}");
-        assert!(markdown.contains("    가의4\\. 가지목"), "item prefix missing 의4: {markdown}");
+        assert!(
+            markdown.contains("##### 제4조의2 (가지조)"),
+            "article heading missing 의2: {markdown}"
+        );
+        assert!(
+            markdown.contains("**①의3**"),
+            "paragraph prefix missing 의3: {markdown}"
+        );
+        assert!(
+            markdown.contains("  1의2\\. 가지호"),
+            "subparagraph prefix missing 의2: {markdown}"
+        );
+        assert!(
+            markdown.contains("    가의4\\. 가지목"),
+            "item prefix missing 의4: {markdown}"
+        );
     }
 
     #[test]
