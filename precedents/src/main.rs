@@ -463,12 +463,12 @@ mod tests {
         );
         let names: Vec<&str> = tree.lines().collect();
         assert!(names.contains(&"README.md"));
-        assert!(names.contains(&"민사/대법원/대법원--2024-01-01--2024가합1.md"));
-        assert!(names.contains(&"형사/하급심/서울고등법원--2024-02-01--2024도1.md"));
+        assert!(names.contains(&"민사/대법원/대법원_2024-01-01_2024가합1.md"));
+        assert!(names.contains(&"형사/하급심/서울고등법원_2024-02-01_2024도1.md"));
 
         let markdown = git_stdout(
             &output,
-            ["show", "HEAD:민사/대법원/대법원--2024-01-01--2024가합1.md"],
+            ["show", "HEAD:민사/대법원/대법원_2024-01-01_2024가합1.md"],
         );
         assert!(markdown.contains("판례일련번호: '1001'"));
         assert!(markdown.contains("# 손해배상"));

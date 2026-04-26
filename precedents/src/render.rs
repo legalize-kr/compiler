@@ -15,12 +15,15 @@ use crate::xml_parser::{
 
 /// Slot separator for the composite filename grammar `{COURT}{SEP}{DATE}{SEP}{CASENO}`.
 ///
+/// Single underscore chosen for readability. Note that `sanitize_case_number` can
+/// also emit `_` inside the CASENO slot (merged cases like `2000나10828_10835_병합`).
+/// Parsing is therefore left-anchored with `splitn(3, SEP)` — court names are Korean
+/// and never contain `_`, the date is fixed `YYYY-MM-DD`, so the first two splits
+/// always isolate (court, date) and the remainder is CASENO.
+///
 /// Kept as a single source of truth so the SEP swap is a one-line change, and must stay
-/// in lockstep with the Python (`legalize-pipeline`) and cli-tools sides. Per plan
-/// §1.1.1's preflight (7) gate, `__` and `~` were both rejected (real cases like
-/// `(제주)2008나56(본소),(제주)2008나63(반소)` sanitize to `..._본소__제주...` which
-/// would collide with `__` SEP), so the cascade landed on `--` (double hyphen).
-pub const SEP: &str = "--";
+/// in lockstep with the Python (`legalize-pipeline`) and cli-tools sides.
+pub const SEP: &str = "_";
 
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
 #[derive(Debug, Default)]
@@ -185,16 +188,9 @@ pub fn sanitize_case_number(case_no: &str) -> String {
     let trimmed = case_no.trim();
     let stripped_leading = leading_parens_re().replace(trimmed, "").into_owned();
     let comma_normalized = stripped_leading.replace(", ", "_").replace(',', "_");
-    let result = remaining_parens_re()
+    remaining_parens_re()
         .replace_all(&comma_normalized, "_$1")
-        .into_owned();
-    // Runtime guard: SEP must never appear in sanitize output, otherwise the composite
-    // filename grammar `{COURT}{SEP}{DATE}{SEP}{CASENO}` becomes ambiguous.
-    debug_assert!(
-        !result.contains(SEP),
-        "sanitize_case_number produced SEP `{SEP}` in {result:?} (input: {case_no:?})",
-    );
-    result
+        .into_owned()
 }
 
 /// Maximum byte length for a filename stem (leaves headroom for `.md` and the
@@ -472,7 +468,7 @@ mod tests {
     #[test]
     fn compose_filename_stem_happy_path() {
         let stem = compose_filename_stem("대법원", "20030310", "2002다56116", "100");
-        assert_eq!(stem, "대법원--2003-03-10--2002다56116");
+        assert_eq!(stem, "대법원_2003-03-10_2002다56116");
     }
 
     #[test]
@@ -483,22 +479,22 @@ mod tests {
             "2000므1257(본소), 1264(반소)",
             "145683",
         );
-        assert_eq!(stem, "대법원--2003-11-14--2000므1257_본소_1264_반소");
+        assert_eq!(stem, "대법원_2003-11-14_2000므1257_본소_1264_반소");
     }
 
     #[test]
     fn compose_filename_stem_missing_date_uses_sentinel() {
         let stem = compose_filename_stem("대법원", "", "2024가합1", "100");
-        assert_eq!(stem, "대법원--0000-00-00--2024가합1");
+        assert_eq!(stem, "대법원_0000-00-00_2024가합1");
         let stem = compose_filename_stem("대법원", "00000000", "2024가합1", "100");
-        assert_eq!(stem, "대법원--0000-00-00--2024가합1");
+        assert_eq!(stem, "대법원_0000-00-00_2024가합1");
     }
 
     #[test]
     fn compose_filename_stem_missing_court_falls_back_to_serial() {
         // Empty court → "미상법원" + CASENO forced to serial.
         let stem = compose_filename_stem("", "20240101", "2024가합1", "999");
-        assert_eq!(stem, "미상법원--2024-01-01--999");
+        assert_eq!(stem, "미상법원_2024-01-01_999");
     }
 
     #[test]
@@ -512,7 +508,7 @@ mod tests {
             stem.len()
         );
         assert!(
-            stem.starts_with("대법원--2011-03-15--"),
+            stem.starts_with("대법원_2011-03-15_"),
             "court+date prefix preserved: {stem}"
         );
         assert!(
@@ -526,11 +522,11 @@ mod tests {
         // Decomposed Hangul (NFD): 가 = U+1100 U+1161, expect NFC-composed 가 in output.
         let nfd_court = "\u{1103}\u{1162}\u{1107}\u{1165}\u{11B8}\u{110B}\u{116F}\u{11AB}"; // 대법원
         let stem = compose_filename_stem(nfd_court, "20240101", "2024가합1", "100");
-        assert_eq!(stem, "대법원--2024-01-01--2024가합1");
+        assert_eq!(stem, "대법원_2024-01-01_2024가합1");
         // Stem is in NFC: per-char count matches NFC form.
         assert_eq!(
             stem.chars().count(),
-            "대법원--2024-01-01--2024가합1".chars().count()
+            "대법원_2024-01-01_2024가합1".chars().count()
         );
     }
 
@@ -564,30 +560,26 @@ mod tests {
         );
         assert_eq!(
             first.to_string(),
-            "민사/대법원/대법원--2024-01-01--2024가합1.md"
+            "민사/대법원/대법원_2024-01-01_2024가합1.md"
         );
         assert_eq!(
             second.to_string(),
-            "민사/대법원/대법원--2024-01-01--2024가합1_200.md"
+            "민사/대법원/대법원_2024-01-01_2024가합1_200.md"
         );
     }
 
     #[test]
-    fn sanitize_case_number_never_emits_sep() {
-        // Regression guard: SEP must not appear inside sanitize output.
-        for input in [
-            "(창원)2024가합1234",
-            "2000므1257, 1264",
-            "2000므1257(본소), 1264(반소)",
-            "2011고합669, 700, 701, 702 (병합) (분리)",
-            "2024가합1",
-        ] {
-            let s = sanitize_case_number(input);
-            assert!(
-                !s.contains(SEP),
-                "SEP `{SEP}` leaked into {s:?} from {input:?}"
-            );
-        }
+    fn sanitize_case_number_emits_underscore_for_merged_cases() {
+        // sanitize output legitimately contains `_` (= SEP) for merged cases. Composite
+        // filename grammar parses left-anchored with splitn(3, SEP) so the embedded
+        // underscores in CASENO never break (court name has no `_`, date is fixed shape).
+        assert_eq!(sanitize_case_number("(창원)2024가합1234"), "2024가합1234");
+        assert_eq!(sanitize_case_number("2000므1257, 1264"), "2000므1257_1264");
+        assert_eq!(
+            sanitize_case_number("2000므1257(본소), 1264(반소)"),
+            "2000므1257_본소_1264_반소"
+        );
+        assert!(sanitize_case_number("2011고합669, 700, 701 (병합)").contains('_'));
     }
 
     #[test]

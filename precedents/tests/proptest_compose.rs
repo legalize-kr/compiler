@@ -3,14 +3,10 @@
 //! Invariants:
 //!   - NFC idempotence: composing twice (input already NFC) yields the same stem.
 //!   - Determinism: same input → same output.
-//!   - Grammar regex: the stem matches `^[^/]+SEP\d{4}-\d{2}-\d{2}SEP[^/]+$`.
-//!   - SEP guard: `sanitize_case_number` never produces `SEP` in its output.
-//!
-//! Input charsets exclude `_` because real Korean 사건번호 strings only contain
-//! Hangul, digits, and `(),` separators (preflight (7) of the plan validates this
-//! against `.cache/precedent/*.xml`). Adversarial inputs containing `_` would
-//! trigger the SEP-decision gate (§1.1.1) and switch SEP to `~`, which is a
-//! separate rollout step driven by the preflight measurement.
+//!   - Grammar regex: stem matches `^[^/_]+_\d{4}-\d{2}-\d{2}_.+$` (left-anchored).
+//!     CASENO may contain `_` (merged cases such as `2000므1257_본소_1264_반소`),
+//!     but court name has no `_` and date is fixed `YYYY-MM-DD`, so left-anchored
+//!     parsing with `splitn(3, SEP)` always isolates (court, date, caseno).
 
 use precedent_kr_compiler::render::{SEP, compose_filename_stem, sanitize_case_number};
 use proptest::prelude::*;
@@ -18,10 +14,11 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 fn grammar_re() -> Regex {
-    // SEP is a constant string; embed as literal escape.
+    // Left-anchored: court has no SEP; CASENO may contain SEP. The date sits between
+    // the first two SEPs, so the first two splits always isolate court+date.
     let escaped = regex::escape(SEP);
     Regex::new(&format!(
-        "^[^/]+{escaped}\\d{{4}}-\\d{{2}}-\\d{{2}}{escaped}[^/]+$"
+        "^[^/{escaped}]+{escaped}\\d{{4}}-\\d{{2}}-\\d{{2}}{escaped}.+$"
     ))
     .unwrap()
 }
@@ -73,13 +70,13 @@ proptest! {
     }
 
     #[test]
-    fn sanitize_never_emits_sep(
-        caseno in "[가-힣0-9()]{0,60}",
+    fn sanitize_is_deterministic_and_nfc(
+        caseno in "[가-힣0-9(),]{0,60}",
     ) {
-        let s = sanitize_case_number(&caseno);
-        prop_assert!(
-            !s.contains(SEP),
-            "SEP `{SEP}` leaked into sanitize output {s:?} from {caseno:?}"
-        );
+        let a = sanitize_case_number(&caseno);
+        let b = sanitize_case_number(&caseno);
+        prop_assert_eq!(&a, &b);
+        let nfc: String = a.nfc().collect();
+        prop_assert_eq!(a, nfc);
     }
 }

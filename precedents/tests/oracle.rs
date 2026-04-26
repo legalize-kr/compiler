@@ -111,15 +111,15 @@ fn oracle_synthetic_fixture_byte_equality() {
     // the full Python dump.
     let lines = [
         // happy path
-        r#"{"serial":"100","court":"대법원","date":"20030310","caseno":"2002다56116","expected_stem":"대법원--2003-03-10--2002다56116"}"#,
+        r#"{"serial":"100","court":"대법원","date":"20030310","caseno":"2002다56116","expected_stem":"대법원_2003-03-10_2002다56116"}"#,
         // 병합/분리
-        r#"{"serial":"145683","court":"대법원","date":"20031114","caseno":"2000므1257(본소), 1264(반소)","expected_stem":"대법원--2003-11-14--2000므1257_본소_1264_반소"}"#,
+        r#"{"serial":"145683","court":"대법원","date":"20031114","caseno":"2000므1257(본소), 1264(반소)","expected_stem":"대법원_2003-11-14_2000므1257_본소_1264_반소"}"#,
         // missing date → 0000-00-00
-        r#"{"serial":"100","court":"대법원","date":"","caseno":"2024가합1","expected_stem":"대법원--0000-00-00--2024가합1"}"#,
+        r#"{"serial":"100","court":"대법원","date":"","caseno":"2024가합1","expected_stem":"대법원_0000-00-00_2024가합1"}"#,
         // missing court → 미상법원 + caseno=serial
-        r#"{"serial":"999","court":"","date":"20240101","caseno":"2024가합1","expected_stem":"미상법원--2024-01-01--999"}"#,
+        r#"{"serial":"999","court":"","date":"20240101","caseno":"2024가합1","expected_stem":"미상법원_2024-01-01_999"}"#,
         // court abbreviation expansion
-        r#"{"serial":"42","court":"서울고법","date":"20200101","caseno":"2019나1","expected_stem":"서울고등법원--2020-01-01--2019나1"}"#,
+        r#"{"serial":"42","court":"서울고법","date":"20200101","caseno":"2019나1","expected_stem":"서울고등법원_2020-01-01_2019나1"}"#,
     ];
     for line in lines {
         let rec: OracleRecord = serde_json::from_str(line).expect("parse synthetic line");
