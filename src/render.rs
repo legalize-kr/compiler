@@ -350,8 +350,10 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                     let stripped = circled_prefix_re.replace(content.trim(), "").to_string();
                     let prefix = if paragraph.number.is_empty() {
                         String::new()
-                    } else {
+                    } else if paragraph.branch_number.is_empty() {
                         format!("**{}**", paragraph.number)
+                    } else {
+                        format!("**{}의{}**", paragraph.number, paragraph.branch_number)
                     };
                     lines.push(format!("{prefix} {stripped}"));
                     lines.push(String::new());
@@ -363,10 +365,13 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                         let stripped = ho_prefix_re.replace(content.trim(), "").to_string();
                         let stripped = normalize_ws(&stripped);
                         let number = subparagraph.number.trim().trim_end_matches('.');
+                        let branch = subparagraph.branch_number.trim();
                         if number.is_empty() {
                             lines.push(format!("  {stripped}"));
-                        } else {
+                        } else if branch.is_empty() {
                             lines.push(format!("  {number}\\. {stripped}"));
+                        } else {
+                            lines.push(format!("  {number}의{branch}\\. {stripped}"));
                         }
                     }
 
@@ -376,10 +381,13 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                             let stripped = mok_prefix_re.replace(content.trim(), "").to_string();
                             let stripped = normalize_ws(&stripped);
                             let number = item.number.trim().trim_end_matches('.');
+                            let branch = item.branch_number.trim();
                             if number.is_empty() {
                                 lines.push(format!("    {stripped}"));
-                            } else {
+                            } else if branch.is_empty() {
                                 lines.push(format!("    {number}\\. {stripped}"));
+                            } else {
+                                lines.push(format!("    {number}의{branch}\\. {stripped}"));
                             }
                         }
                     }
@@ -604,12 +612,15 @@ mod tests {
                 content: String::from("제1조 (정의) 본문"),
                 paragraphs: vec![Paragraph {
                     number: String::from("①"),
+                    branch_number: String::new(),
                     content: String::from("①정의"),
                     subparagraphs: vec![Subparagraph {
                         number: String::from("1."),
+                        branch_number: String::new(),
                         content: String::from("1.  첫 호"),
                         items: vec![crate::xml_parser::Item {
                             number: String::from("가."),
+                            branch_number: String::new(),
                             content: String::from("가.  첫 목"),
                         }],
                     }],
@@ -625,6 +636,56 @@ mod tests {
         assert!(markdown.contains("  1\\. 첫 호"));
         assert!(markdown.contains("    가\\. 첫 목"));
         assert!(markdown.contains("## 부칙"));
+    }
+
+    #[test]
+    fn markdown_renders_branch_numbers_for_jo_hang_ho_mok() {
+        //
+        // Regression for legalize-kr/legalize-pipeline#2: 조문가지번호·호가지번호가 드롭되어
+        // `제4조의2`가 `제4조`로, `제1호의2`가 `1.`로 렌더되던 문제. 항/목 가지번호는 현재
+        // 업스트림에 나타나지 않지만 파서·렌더가 대칭적으로 처리해야 한다.
+        //
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                mst: String::from("1"),
+                law_name: String::from("테스트법"),
+                law_id: String::from("000001"),
+                law_type: String::from("법률"),
+                promulgation_date: String::from("20240101"),
+                promulgation_number: String::from("00001"),
+                enforcement_date: String::from("20240101"),
+                department_name: String::from("법무부"),
+                ..LawMetadata::default()
+            },
+            articles: vec![Article {
+                number: String::from("4"),
+                branch_number: String::from("2"),
+                title: String::from("가지조"),
+                content: String::from("제4조의2 (가지조) 본문"),
+                paragraphs: vec![Paragraph {
+                    number: String::from("①"),
+                    branch_number: String::from("3"),
+                    content: String::from("①가지항"),
+                    subparagraphs: vec![Subparagraph {
+                        number: String::from("1."),
+                        branch_number: String::from("2"),
+                        content: String::from("1의2.  가지호"),
+                        items: vec![crate::xml_parser::Item {
+                            number: String::from("가."),
+                            branch_number: String::from("4"),
+                            content: String::from("가의4.  가지목"),
+                        }],
+                    }],
+                }],
+            }],
+            addenda: Vec::new(),
+        };
+
+        let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
+        assert!(markdown.contains("##### 제4조의2 (가지조)"), "article heading missing 의2: {markdown}");
+        assert!(markdown.contains("**①의3**"), "paragraph prefix missing 의3: {markdown}");
+        assert!(markdown.contains("  1의2\\. 가지호"), "subparagraph prefix missing 의2: {markdown}");
+        assert!(markdown.contains("    가의4\\. 가지목"), "item prefix missing 의4: {markdown}");
     }
 
     #[test]

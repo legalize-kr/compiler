@@ -35,6 +35,8 @@ pub struct LawMetadata {
 pub struct Item {
     /// Display number such as `가.`.
     pub number: String,
+    /// Item branch number (`목가지번호`) for items like `가목의2`. Empty when absent.
+    pub branch_number: String,
     /// Rendered item body text.
     pub content: String,
 }
@@ -44,6 +46,8 @@ pub struct Item {
 pub struct Subparagraph {
     /// Display number such as `1.`.
     pub number: String,
+    /// Subparagraph branch number (`호가지번호`) for subparagraphs like `제1호의2`. Empty when absent.
+    pub branch_number: String,
     /// Rendered subparagraph body text.
     pub content: String,
     /// Nested item list.
@@ -55,6 +59,8 @@ pub struct Subparagraph {
 pub struct Paragraph {
     /// Display number such as `①`.
     pub number: String,
+    /// Paragraph branch number (`항가지번호`) for paragraphs like `제1항의2`. Empty when absent.
+    pub branch_number: String,
     /// Rendered paragraph body text.
     pub content: String,
     /// Nested subparagraph list.
@@ -328,6 +334,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
         for paragraph_node in paragraph_nodes {
             let mut paragraph = Paragraph {
                 number: paragraph_node.child_text("항번호"),
+                branch_number: paragraph_node.child_text("항가지번호"),
                 content: paragraph_node.child_text("항내용"),
                 subparagraphs: Vec::new(),
             };
@@ -337,6 +344,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
             for subparagraph_node in subparagraph_nodes {
                 let mut subparagraph = Subparagraph {
                     number: subparagraph_node.child_text("호번호"),
+                    branch_number: subparagraph_node.child_text("호가지번호"),
                     content: subparagraph_node.child_text("호내용"),
                     items: Vec::new(),
                 };
@@ -346,6 +354,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
                 for item_node in item_nodes {
                     subparagraph.items.push(Item {
                         number: item_node.child_text("목번호"),
+                        branch_number: item_node.child_text("목가지번호"),
                         content: item_node.child_text("목내용"),
                     });
                 }
@@ -452,5 +461,56 @@ mod tests {
             body.articles[0].paragraphs[0].subparagraphs[0].items.len(),
             1
         );
+    }
+
+    #[test]
+    fn parses_branch_numbers_for_jo_hang_ho_mok() {
+        //
+        // Mirrors the real law.go.kr payload for 물환경보전법 MST=283441 where 조문가지번호
+        // and 호가지번호 distinguish `제4조의2` from `제4조` and `제1호의2` from `제1호`.
+        // The 항가지번호 / 목가지번호 tags never appear in current caches but the schema is
+        // symmetric, so we assert the parser surfaces them when an upstream payload includes them.
+        //
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>1</법령ID>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[테스트법]]></법령명_한글>
+  </기본정보>
+  <조문>
+    <조문단위>
+      <조문번호>4</조문번호>
+      <조문가지번호>2</조문가지번호>
+      <조문제목><![CDATA[가지조]]></조문제목>
+      <조문내용><![CDATA[제4조의2 (가지조) 본문]]></조문내용>
+      <항>
+        <항번호><![CDATA[①]]></항번호>
+        <항가지번호><![CDATA[3]]></항가지번호>
+        <항내용><![CDATA[①가지항]]></항내용>
+        <호>
+          <호번호><![CDATA[1.]]></호번호>
+          <호가지번호><![CDATA[2]]></호가지번호>
+          <호내용><![CDATA[1의2. 가지호]]></호내용>
+          <목>
+            <목번호><![CDATA[가.]]></목번호>
+            <목가지번호><![CDATA[4]]></목가지번호>
+            <목내용><![CDATA[가의4. 가지목]]></목내용>
+          </목>
+        </호>
+      </항>
+    </조문단위>
+  </조문>
+</법령>"#;
+
+        let body = parse_law_body(xml.as_bytes()).unwrap();
+        let article = &body.articles[0];
+        assert_eq!(article.branch_number, "2");
+        let paragraph = &article.paragraphs[0];
+        assert_eq!(paragraph.branch_number, "3");
+        let subparagraph = &paragraph.subparagraphs[0];
+        assert_eq!(subparagraph.branch_number, "2");
+        let item = &subparagraph.items[0];
+        assert_eq!(item.branch_number, "4");
     }
 }
