@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Versioned pre-commit hook. Activate once with:
+#   git config core.hooksPath .githooks
+#
+# Mirrors the CI "cargo fmt -- --check" gate so that fmt drift is caught
+# before it reaches origin/main and breaks the release pipeline.
+# Bypass with `git commit --no-verify` only when intentional.
+
+set -e
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found on PATH; skipping fmt check" >&2
+    exit 0
+fi
+
+# Only run when staged changes touch Rust sources.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rustfmt\.toml$'; then
+    echo "pre-commit: cargo fmt -- --check"
+    if ! cargo fmt -- --check; then
+        echo
+        echo "pre-commit: rustfmt diff detected. Run 'cargo fmt' and re-stage." >&2
+        exit 1
+    fi
+fi
