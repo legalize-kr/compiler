@@ -74,6 +74,9 @@ pub struct Article {
     pub number: String,
     /// Article branch number (`조문가지번호`) for articles like `제52조의2`. Empty when absent.
     pub branch_number: String,
+    /// Upstream article marker (`조문여부`): usually `조문` for real articles or `전문` for
+    /// structure/preamble payloads.
+    pub kind: String,
     /// Optional article title.
     pub title: String,
     /// Leading article text before numbered paragraphs.
@@ -324,6 +327,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
         let mut article = Article {
             number: node.child_text("조문번호"),
             branch_number: node.child_text("조문가지번호"),
+            kind: node.child_text("조문여부"),
             title: node.child_text("조문제목"),
             content: node.child_text("조문내용"),
             paragraphs: Vec::new(),
@@ -512,5 +516,34 @@ mod tests {
         assert_eq!(subparagraph.branch_number, "2");
         let item = &subparagraph.items[0];
         assert_eq!(item.branch_number, "4");
+    }
+
+    #[test]
+    fn parses_article_kind() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>1</법령ID>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[테스트법]]></법령명_한글>
+  </기본정보>
+  <조문>
+    <조문단위>
+      <조문번호>898</조문번호>
+      <조문여부>전문</조문여부>
+      <조문내용><![CDATA[제1항 협의상 파양]]></조문내용>
+    </조문단위>
+    <조문단위>
+      <조문번호>898</조문번호>
+      <조문여부>조문</조문여부>
+      <조문제목><![CDATA[협의상 파양]]></조문제목>
+      <조문내용><![CDATA[제898조(협의상 파양) 본문]]></조문내용>
+    </조문단위>
+  </조문>
+</법령>"#;
+
+        let body = parse_law_body(xml.as_bytes()).unwrap();
+        assert_eq!(body.articles[0].kind, "전문");
+        assert_eq!(body.articles[1].kind, "조문");
     }
 }

@@ -281,7 +281,12 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
         let mut lines = Vec::new();
         let structure_re = {
             static INSTANCE: OnceLock<Regex> = OnceLock::new();
-            INSTANCE.get_or_init(|| Regex::new(r"^제\d+(?:의\d+)?(편|장|절|관)\s*").unwrap())
+            INSTANCE.get_or_init(|| {
+                Regex::new(
+                    r"^제\s*[\d일이삼사오육칠팔구십]+(?:의\s*[\d일이삼사오육칠팔구십]+)?\s*([편장절관항속목])\s*",
+                )
+                .unwrap()
+            })
         };
         let article_prefix_re = {
             static INSTANCE: OnceLock<Regex> = OnceLock::new();
@@ -311,6 +316,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
 
             if title.is_empty()
                 && let Some(captures) = structure_re.captures(&content)
+                && (article.kind == "전문" || article.kind.is_empty())
             {
                 let level = match captures.get(1).map(|m| m.as_str()) {
                     Some("편") => "#",
@@ -324,6 +330,22 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                     lines.push(String::new());
                     continue;
                 }
+                if matches!(
+                    captures.get(1).map(|m| m.as_str()),
+                    Some("항" | "속" | "목")
+                ) {
+                    lines.push(format!("**{content}**"));
+                    lines.push(String::new());
+                    continue;
+                }
+            }
+
+            if article.kind == "전문" {
+                if !content.is_empty() {
+                    lines.push(content);
+                    lines.push(String::new());
+                }
+                continue;
             }
 
             let mut heading = format!("##### 제{number}조");
@@ -572,6 +594,30 @@ mod tests {
     }
 
     #[test]
+    fn path_registry_treats_title_rename_as_same_law() {
+        let mut registry = PathRegistry::default();
+        let (path, _) = registry.get_law_path(
+            "헌법재판소 참고인 비용지급에 관한 규칙",
+            "헌법재판소규칙",
+            "006104",
+        );
+        assert_eq!(
+            path,
+            RepoPathBuf::kr_file("헌법재판소참고인비용지급에관한규칙", "헌법재판소규칙.md",)
+        );
+
+        let (path, _) = registry.get_law_path(
+            "헌법재판소 참고인 등 비용지급에 관한 규칙",
+            "헌법재판소규칙",
+            "006104",
+        );
+        assert_eq!(
+            path,
+            RepoPathBuf::kr_file("헌법재판소참고인비용지급에관한규칙", "헌법재판소규칙.md",)
+        );
+    }
+
+    #[test]
     fn path_registry_merges_qualified_paths_for_same_law_id() {
         let mut registry = PathRegistry::default();
         // ID001 claims the base path
@@ -608,6 +654,7 @@ mod tests {
             articles: vec![Article {
                 number: String::from("1"),
                 branch_number: String::new(),
+                kind: String::from("조문"),
                 title: String::from("정의"),
                 content: String::from("제1조 (정의) 본문"),
                 paragraphs: vec![Paragraph {
@@ -660,6 +707,7 @@ mod tests {
             articles: vec![Article {
                 number: String::from("4"),
                 branch_number: String::from("2"),
+                kind: String::from("조문"),
                 title: String::from("가지조"),
                 content: String::from("제4조의2 (가지조) 본문"),
                 paragraphs: vec![Paragraph {
@@ -698,6 +746,110 @@ mod tests {
             markdown.contains("    가의4\\. 가지목"),
             "item prefix missing 의4: {markdown}"
         );
+    }
+
+    #[test]
+    fn markdown_renders_non_article_structure_without_article_number_headings() {
+        let base_article = |content: &str| Article {
+            number: String::from("350"),
+            branch_number: String::new(),
+            kind: String::from("전문"),
+            title: String::new(),
+            content: content.to_owned(),
+            paragraphs: Vec::new(),
+        };
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                mst: String::from("1"),
+                law_name: String::from("테스트법"),
+                law_id: String::from("000001"),
+                law_type: String::from("법률"),
+                promulgation_date: String::from("20240101"),
+                promulgation_number: String::from("00001"),
+                enforcement_date: String::from("20240101"),
+                department_name: String::from("법무부"),
+                ..LawMetadata::default()
+            },
+            articles: vec![
+                base_article("제1편 총칙"),
+                base_article("제1장 통칙"),
+                base_article("제1절 원칙"),
+                base_article("제1관 범위"),
+                base_article("제1항 협의상 파양"),
+                base_article("제1속 조사 등"),
+                base_article("제1목 통칙"),
+                Article {
+                    number: String::from("350"),
+                    branch_number: String::new(),
+                    kind: String::from("조문"),
+                    title: String::from("진짜 조문"),
+                    content: String::from("제350조(진짜 조문) 본문"),
+                    paragraphs: Vec::new(),
+                },
+            ],
+            addenda: Vec::new(),
+        };
+
+        let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
+        assert!(markdown.contains("# 제1편 총칙"));
+        assert!(markdown.contains("## 제1장 통칙"));
+        assert!(markdown.contains("### 제1절 원칙"));
+        assert!(markdown.contains("#### 제1관 범위"));
+        assert!(markdown.contains("**제1항 협의상 파양**"));
+        assert!(markdown.contains("**제1속 조사 등**"));
+        assert!(markdown.contains("**제1목 통칙**"));
+        assert!(!markdown.contains("##### 제350조\n\n제1항 협의상 파양"));
+        assert_eq!(markdown.matches("##### 제350조").count(), 1);
+        assert!(markdown.contains("##### 제350조 (진짜 조문)"));
+    }
+
+    #[test]
+    fn markdown_renders_non_article_plain_content_without_zero_article_heading() {
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                mst: String::from("1"),
+                law_name: String::from("테스트법"),
+                law_id: String::from("000001"),
+                law_type: String::from("법률"),
+                promulgation_date: String::from("20240101"),
+                promulgation_number: String::from("00001"),
+                enforcement_date: String::from("20240101"),
+                department_name: String::from("법무부"),
+                ..LawMetadata::default()
+            },
+            articles: vec![
+                Article {
+                    number: String::from("0"),
+                    branch_number: String::new(),
+                    kind: String::from("전문"),
+                    title: String::new(),
+                    content: String::from("전문"),
+                    paragraphs: Vec::new(),
+                },
+                Article {
+                    number: String::from("0"),
+                    branch_number: String::new(),
+                    kind: String::from("전문"),
+                    title: String::new(),
+                    content: String::from("유구한 역사와 전통에 빛나는 우리 대한국민은..."),
+                    paragraphs: Vec::new(),
+                },
+                Article {
+                    number: String::from("1"),
+                    branch_number: String::new(),
+                    kind: String::from("조문"),
+                    title: String::new(),
+                    content: String::new(),
+                    paragraphs: Vec::new(),
+                },
+            ],
+            addenda: Vec::new(),
+        };
+
+        let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
+        assert!(!markdown.contains("##### 제0조"));
+        assert!(markdown.contains("전문\n\n유구한 역사와 전통에 빛나는 우리 대한국민은..."));
+        assert!(markdown.contains("##### 제1조"));
     }
 
     #[test]
