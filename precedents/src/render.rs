@@ -115,9 +115,12 @@ pub fn cap_caseno_slot(court: &str, date: &str, caseno: &str, serial: &str) -> S
     }
     let prefix = format!("{court}{SEP}{date}{SEP}");
     let suffix = format!("_{serial}");
-    let keep = MAX_FILENAME_STEM_BYTES
-        .saturating_sub(prefix.len())
-        .saturating_sub(suffix.len());
+    let Some(keep) = MAX_FILENAME_STEM_BYTES
+        .checked_sub(prefix.len())
+        .and_then(|remaining| remaining.checked_sub(suffix.len()))
+    else {
+        return format!("{prefix}{serial}");
+    };
     let mut end = keep.min(caseno.len());
     while end > 0 && !caseno.is_char_boundary(end) {
         end -= 1;
@@ -272,14 +275,15 @@ fn multi_space_re() -> &'static Regex {
     INSTANCE.get_or_init(|| Regex::new(r"[ \u{00A0}]{3,}").unwrap())
 }
 
-/// Inline whitespace normalization for 사건명 (frontmatter + H1 title).
-///
-/// Converts `<br>` to a single space (keeps the name single-line), strips
-/// remaining tags, decodes HTML entities, and collapses 3+ space/NBSP runs.
-pub fn normalize_case_name(text: &str) -> String {
-    let with_spaces = br_re().replace_all(text, " ").into_owned();
-    let stripped = html_tag_re().replace_all(&with_spaces, "").into_owned();
-    let decoded = stripped
+/// Pattern matching decimal and hexadecimal numeric HTML character references.
+fn numeric_entity_re() -> &'static Regex {
+    static INSTANCE: OnceLock<Regex> = OnceLock::new();
+    INSTANCE.get_or_init(|| Regex::new(r"&#(?:x([0-9A-Fa-f]+)|([0-9]+));").unwrap())
+}
+
+/// Decodes the HTML entities that appear in upstream text snippets.
+fn decode_html_entities(text: &str) -> String {
+    let decoded = text
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -287,6 +291,30 @@ pub fn normalize_case_name(text: &str) -> String {
         .replace("&apos;", "'")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ");
+
+    numeric_entity_re()
+        .replace_all(&decoded, |captures: &regex::Captures<'_>| {
+            let parsed = captures
+                .get(1)
+                .map(|hex| u32::from_str_radix(hex.as_str(), 16))
+                .unwrap_or_else(|| captures[2].parse::<u32>());
+            parsed
+                .ok()
+                .and_then(char::from_u32)
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| captures[0].to_owned())
+        })
+        .into_owned()
+}
+
+/// Inline whitespace normalization for 사건명 (frontmatter + H1 title).
+///
+/// Converts `<br>` to a single space (keeps the name single-line), strips
+/// remaining tags, decodes HTML entities, and collapses 3+ space/NBSP runs.
+pub fn normalize_case_name(text: &str) -> String {
+    let with_spaces = br_re().replace_all(text, " ").into_owned();
+    let stripped = html_tag_re().replace_all(&with_spaces, "").into_owned();
+    let decoded = decode_html_entities(&stripped);
     let spaced = multi_space_re().replace_all(&decoded, " ").into_owned();
     spaced.trim().to_owned()
 }
@@ -295,14 +323,7 @@ pub fn normalize_case_name(text: &str) -> String {
 pub fn html_to_markdown(html: &str) -> String {
     let with_newlines = br_re().replace_all(html, "\n").into_owned();
     let stripped = html_tag_re().replace_all(&with_newlines, "").into_owned();
-    let decoded = stripped
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
+    let decoded = decode_html_entities(&stripped);
     let collapsed = multi_blank_re().replace_all(&decoded, "\n\n").into_owned();
     let spaced = multi_space_re().replace_all(&collapsed, " ").into_owned();
     spaced.trim().to_owned()
@@ -518,6 +539,13 @@ mod tests {
     }
 
     #[test]
+    fn cap_caseno_slot_falls_back_to_serial_when_prefix_exceeds_budget() {
+        let long_court = "가".repeat(80);
+        let stem = cap_caseno_slot(&long_court, "2024-01-01", "2024가합1", "123456");
+        assert_eq!(stem, format!("{long_court}_2024-01-01_123456"));
+    }
+
+    #[test]
     fn compose_filename_stem_normalizes_to_nfc() {
         // Decomposed Hangul (NFD): 가 = U+1100 U+1161, expect NFC-composed 가 in output.
         let nfd_court = "\u{1103}\u{1162}\u{1107}\u{1165}\u{11B8}\u{110B}\u{116F}\u{11AB}"; // 대법원
@@ -665,5 +693,11 @@ mod tests {
     #[test]
     fn nbsp_decoded_then_space_collapsed() {
         assert_eq!(html_to_markdown("a&nbsp;&nbsp;&nbsp;b"), "a b");
+    }
+
+    #[test]
+    fn numeric_html_entities_are_decoded() {
+        assert_eq!(normalize_case_name("손해&#40;배상&#41;"), "손해(배상)");
+        assert_eq!(html_to_markdown("A&#x2F;B &#47; C"), "A/B / C");
     }
 }

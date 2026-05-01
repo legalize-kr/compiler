@@ -32,6 +32,9 @@ use crate::xml_parser::{
 /// Bundled README payload for the synthetic initial commit.
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
 
+/// Root `.gitignore` payload matching the generated `precedent-kr` data repository.
+const REPOSITORY_GITIGNORE: &[u8] = b"metadata.json\nstats.json\n";
+
 /// Global allocator tuned for high-throughput allocation-heavy pack generation.
 #[cfg(feature = "default")]
 #[global_allocator]
@@ -175,13 +178,13 @@ fn run(cli: Cli) -> Result<()> {
         // Re-sort by 선고일자 ASC (with serial as a stable tiebreak) so the commit
         // graph follows chronological order. The serial sort above is preserved as
         // the *collision-resolution* order; this re-sort only affects the order in
-        // which precedents are appended to the commit chain. Empty/sentinel dates
-        // sort first (clamp to git epoch in pass 2), matching the laws pipeline.
+        // which precedents are appended to the commit chain. Empty dates sort last,
+        // matching `precedents/import_precedents.py --git`; sentinel dates such as
+        // `00000000` retain their raw lexical order and clamp to the Git epoch in pass 2.
         //
         entries.sort_by(|left, right| {
-            left.metadata
-                .judgment_date
-                .cmp(&right.metadata.judgment_date)
+            judgment_sort_key(&left.metadata.judgment_date)
+                .cmp(judgment_sort_key(&right.metadata.judgment_date))
                 .then_with(|| left.serial.cmp(&right.serial))
         });
 
@@ -210,6 +213,13 @@ fn run(cli: Cli) -> Result<()> {
         INITIAL_COMMIT_EPOCH,
     )?;
     eprintln!("  committed README.md");
+    repo.commit_static(
+        &RepoPathBuf::root_file(".gitignore"),
+        REPOSITORY_GITIGNORE,
+        "Add generated metadata ignores",
+        INITIAL_COMMIT_EPOCH,
+    )?;
+    eprintln!("  committed .gitignore");
     repo.commit_empty_initial_contributor(
         "Add @simnalamburt as a contributor",
         INITIAL_COMMIT_EPOCH,
@@ -380,6 +390,15 @@ fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Sort key matching Python `e[0].get("선고일자", "") or "99999999"`.
+fn judgment_sort_key(judgment_date: &str) -> &str {
+    if judgment_date.is_empty() {
+        "99999999"
+    } else {
+        judgment_date
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -447,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
-            "4"
+            "5"
         );
 
         let tree = git_stdout(
@@ -463,6 +482,7 @@ mod tests {
         );
         let names: Vec<&str> = tree.lines().collect();
         assert!(names.contains(&"README.md"));
+        assert!(names.contains(&".gitignore"));
         assert!(names.contains(&"민사/대법원/대법원_2024-01-01_2024가합1.md"));
         assert!(names.contains(&"형사/하급심/서울고등법원_2024-02-01_2024도1.md"));
 
@@ -473,6 +493,54 @@ mod tests {
         assert!(markdown.contains("판례일련번호: '1001'"));
         assert!(markdown.contains("# 손해배상"));
         assert!(markdown.contains("## 판시사항"));
+    }
+
+    #[test]
+    fn emits_legacy_paths_json_with_missing_old_paths_as_null() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join(".cache").join("precedent");
+        fs::create_dir_all(&cache_dir).unwrap();
+        write_sample(&cache_dir, "1001", SAMPLE_PREC_1);
+        write_sample(&cache_dir, "1002", SAMPLE_PREC_2);
+
+        let legacy_root = temp.path().join("legacy");
+        let legacy_file = legacy_root.join("민사").join("대법원").join("2024가합1.md");
+        fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        fs::write(&legacy_file, "legacy").unwrap();
+
+        let legacy_paths = temp.path().join("legacy-paths.json");
+        run(Cli {
+            cache_dir,
+            output: temp.path().join("output.git"),
+            emit_legacy_paths: Some(legacy_paths.clone()),
+            legacy_precedent_root: Some(legacy_root),
+        })
+        .unwrap();
+
+        let raw = fs::read_to_string(&legacy_paths).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entries = payload.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0]["판례일련번호"], "1001");
+        assert_eq!(entries[0]["old_path"], "민사/대법원/2024가합1.md");
+        assert_eq!(
+            entries[0]["new_path"],
+            "민사/대법원/대법원_2024-01-01_2024가합1.md"
+        );
+
+        assert_eq!(entries[1]["판례일련번호"], "1002");
+        assert!(entries[1]["old_path"].is_null());
+        assert_eq!(
+            entries[1]["new_path"],
+            "형사/하급심/서울고등법원_2024-02-01_2024도1.md"
+        );
+    }
+
+    #[test]
+    fn empty_judgment_dates_sort_last_like_python_git_import() {
+        assert!(judgment_sort_key("00000000") < judgment_sort_key("19700101"));
+        assert!(judgment_sort_key("20240101") < judgment_sort_key(""));
     }
 
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
