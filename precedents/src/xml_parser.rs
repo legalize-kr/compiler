@@ -120,15 +120,11 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
                     return Ok(Some(metadata));
                 }
             }
-            Event::Text(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&decode_text(text.as_ref())?);
-                }
+            Event::Text(text) if capture_tag.is_some() => {
+                capture_text.push_str(&decode_text(text.as_ref())?);
             }
-            Event::CData(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
+            Event::CData(text) if capture_tag.is_some() => {
+                capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
             }
             Event::End(event) => {
                 let tag = decode_name(event.name().as_ref())?;
@@ -190,20 +186,14 @@ pub fn parse_precedent_body(xml: &[u8]) -> Result<PrecedentBody> {
                     capture_tag = Some(tag);
                 }
             }
-            Event::Empty(_) => {
-                if !root_seen {
-                    root_seen = true;
-                }
+            Event::Empty(_) if !root_seen => {
+                root_seen = true;
             }
-            Event::Text(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&decode_text(text.as_ref())?);
-                }
+            Event::Text(text) if capture_tag.is_some() => {
+                capture_text.push_str(&decode_text(text.as_ref())?);
             }
-            Event::CData(text) => {
-                if capture_tag.is_some() {
-                    capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
+            Event::CData(text) if capture_tag.is_some() => {
+                capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
             }
             Event::End(event) => {
                 let tag = decode_name(event.name().as_ref())?;
