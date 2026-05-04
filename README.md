@@ -1,8 +1,9 @@
 # legalize-kr / compiler
 
 [legalize-kr/legalize-pipeline]이 만드는 `.cache/` 디렉토리를 입력으로 받아
-법령(`legalize-kr`) 및 판례(`precedent-kr`) bare Git 저장소를 직접 써내는
-Rust 컴파일러 모음입니다. 두 도메인이 한 Cargo workspace 안에 멤버 크레이트로
+법령(`legalize-kr`), 판례(`precedent-kr`), 행정규칙(`admrule-kr`),
+자치법규(`ordinance-kr`) bare Git 저장소를 직접 써내는 Rust 컴파일러
+모음입니다. 각 도메인이 한 Cargo workspace 안에 멤버 크레이트로
 공존합니다.
 
 [legalize-kr/legalize-pipeline]: https://github.com/legalize-kr/legalize-pipeline
@@ -13,7 +14,9 @@ Rust 컴파일러 모음입니다. 두 도메인이 한 Cargo workspace 안에 �
 compiler/
 ├── Cargo.toml         # virtual workspace
 ├── Cargo.lock         # 단일 lockfile
+├── admrules/          # 행정규칙 컴파일러 (binary: admrule-kr-compiler)
 ├── laws/              # 법령 컴파일러 (binary: legalize-kr-compiler)
+├── ordinances/        # 자치법규 컴파일러 (binary: ordinance-kr-compiler)
 └── precedents/        # 판례 컴파일러 (binary: precedent-kr-compiler)
 ```
 
@@ -21,6 +24,8 @@ compiler/
 
 - 법령: [`laws/README.md`](laws/README.md)
 - 판례: [`precedents/README.md`](precedents/README.md)
+- 행정규칙 결과 README: [`admrules/assets/README.md`](admrules/assets/README.md)
+- 자치법규 결과 README: [`ordinances/assets/README.md`](ordinances/assets/README.md)
 
 ## 빠른 시작
 
@@ -33,6 +38,12 @@ cargo build --workspace --release
 
 # 판례 컴파일
 ./target/release/precedent-kr-compiler ../.cache/precedent -o ./precedent-output.git
+
+# 행정규칙 컴파일
+./target/release/admrule-kr-compiler ../.cache/admrule -o ./admrule-output.git --bare
+
+# 자치법규 컴파일
+./target/release/ordinance-kr-compiler ../.cache/ordinance -o ./ordinance-output.git --bare
 ```
 
 ## CI 4종 게이트

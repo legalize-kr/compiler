@@ -6,8 +6,6 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_docs_in_private_items)]
 
-/// Writes the output bare repository and handcrafted packfile stream.
-mod git_repo;
 /// Renders parsed precedent data into Markdown and commit messages.
 mod render;
 /// Parses cached XML documents into metadata and body structures.
@@ -18,9 +16,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
 use rayon::prelude::*;
+use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
-use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
 use crate::render::{
     PathRegistry, build_commit_message, get_precedent_path, legacy_get_precedent_path,
     precedent_to_markdown,
@@ -220,11 +219,6 @@ fn run(cli: Cli) -> Result<()> {
         INITIAL_COMMIT_EPOCH,
     )?;
     eprintln!("  committed .gitignore");
-    repo.commit_empty_initial_contributor(
-        "Add @simnalamburt as a contributor",
-        INITIAL_COMMIT_EPOCH,
-    )?;
-    eprintln!("  committed contributor marker");
 
     //
     // Parse/render chunks in parallel while the main thread keeps Git writes ordered.
@@ -362,7 +356,7 @@ fn render_entry(cache_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
         metadata: entry.metadata.clone(),
         body,
     };
-    let time = GitTimestampKst::from_judgment_date(&detail.metadata.judgment_date)?;
+    let time = timestamp_from_judgment_date(&detail.metadata.judgment_date)?;
 
     let markdown = precedent_to_markdown(&detail)?;
     let (blob_sha, compressed_blob) = precompute_blob(&markdown);
@@ -397,6 +391,38 @@ fn judgment_sort_key(judgment_date: &str) -> &str {
     } else {
         judgment_date
     }
+}
+
+/// Converts a 선고일자 into the deterministic noon-KST commit timestamp.
+fn timestamp_from_judgment_date(judgment_date: &str) -> Result<GitTimestampKst> {
+    if judgment_date.is_empty() {
+        return Ok(GitTimestampKst::from_epoch(0));
+    }
+    if judgment_date.len() != 8 || !judgment_date.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("expected judgment date in YYYYMMDD form: {judgment_date}");
+    }
+
+    let effective_date = if judgment_date < "19700101" {
+        String::from("1970-01-01")
+    } else {
+        format!(
+            "{}-{}-{}",
+            &judgment_date[..4],
+            &judgment_date[4..6],
+            &judgment_date[6..8]
+        )
+    };
+
+    let year = effective_date[0..4].parse::<i32>()?;
+    let month = Month::try_from(effective_date[5..7].parse::<u8>()?)?;
+    let day = effective_date[8..10].parse::<u8>()?;
+    let date = Date::from_calendar_date(year, month, day)?;
+    let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
+    Ok(GitTimestampKst::from_epoch(
+        datetime
+            .assume_offset(UtcOffset::from_hms(9, 0, 0)?)
+            .unix_timestamp(),
+    ))
 }
 
 #[cfg(test)]
@@ -460,13 +486,14 @@ mod tests {
         })
         .unwrap();
 
+        git_stdout(&output, ["fsck", "--full"]);
         assert_eq!(
             git_stdout(&output, ["symbolic-ref", "--short", "HEAD"]).trim(),
             "main"
         );
         assert_eq!(
             git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
-            "5"
+            "4"
         );
 
         let tree = git_stdout(
@@ -541,6 +568,66 @@ mod tests {
     fn empty_judgment_dates_sort_last_like_python_git_import() {
         assert!(judgment_sort_key("00000000") < judgment_sort_key("19700101"));
         assert!(judgment_sort_key("20240101") < judgment_sort_key(""));
+    }
+
+    #[test]
+    fn rejects_non_compact_judgment_dates() {
+        let error = timestamp_from_judgment_date("2024-01-01").unwrap_err();
+        assert!(error.to_string().contains("YYYYMMDD"));
+    }
+
+    #[test]
+    fn clamps_pre_epoch_judgment_dates() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("output.git");
+        let mut writer = BareRepoWriter::create(&output).unwrap();
+        let body = b"body";
+        let (blob_sha, compressed_blob) = precompute_blob(body);
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("민사", "대법원", "1949.md"),
+                body,
+                blob_sha,
+                &compressed_blob,
+                "message",
+                timestamp_from_judgment_date("19491021").unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            git_stdout(&output, ["show", "-s", "--format=%at", "HEAD"]).trim(),
+            "10800"
+        );
+        assert_eq!(
+            git_stdout(&output, ["show", "-s", "--format=%ai", "HEAD"]).trim(),
+            "1970-01-01 12:00:00 +0900"
+        );
+    }
+
+    #[test]
+    fn empty_judgment_date_uses_unix_epoch() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("output.git");
+        let mut writer = BareRepoWriter::create(&output).unwrap();
+        let body = b"body";
+        let (blob_sha, compressed_blob) = precompute_blob(body);
+        writer
+            .commit_precedent(
+                &RepoPathBuf::prec_file("기타", "미분류", "serial.md"),
+                body,
+                blob_sha,
+                &compressed_blob,
+                "message",
+                timestamp_from_judgment_date("").unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            git_stdout(&output, ["show", "-s", "--format=%at", "HEAD"]).trim(),
+            "0"
+        );
     }
 
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {

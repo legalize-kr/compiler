@@ -1,0 +1,751 @@
+//! Compile cached law.go.kr ordinance XML into a Markdown tree.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
+use quick_xml::Reader;
+use quick_xml::events::Event;
+use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
+use unicode_normalization::UnicodeNormalization;
+
+const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
+
+/// Command-line interface.
+#[derive(Debug, Parser)]
+#[command(name = "ordinance-kr-compiler")]
+struct Cli {
+    /// Directory containing `{자치법규ID}.xml` files.
+    cache_dir: PathBuf,
+    /// Output Markdown tree directory.
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    /// Limit input files for probe runs.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Write a bare Git repository instead of a Markdown tree.
+    #[arg(long)]
+    bare: bool,
+}
+
+/// Parsed ordinance data.
+#[derive(Debug, Clone)]
+struct Ordinance {
+    /// 자치법규ID.
+    id: String,
+    /// 자치법규일련번호.
+    serial: String,
+    /// 자치법규명.
+    name: String,
+    /// 자치법규종류.
+    ordinance_type: String,
+    /// 지자체기관명.
+    jurisdiction: String,
+    /// 공포일자 raw.
+    prom_date_raw: String,
+    /// 공포번호.
+    prom_no: String,
+    /// 시행일자 raw.
+    effective_date_raw: String,
+    /// 제개정구분.
+    amendment: String,
+    /// 자치법규분야.
+    field: String,
+    /// 담당부서.
+    department: String,
+    /// Body text.
+    body: String,
+    /// Parsed article-like units.
+    articles: Vec<Article>,
+    /// Addenda text blocks.
+    addenda: Vec<String>,
+}
+
+/// Parsed ordinance article unit.
+#[derive(Debug, Clone)]
+struct Article {
+    no: String,
+    title: String,
+    content: String,
+}
+
+/// 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC.
+const INITIAL_COMMIT_EPOCH: i64 = 1_774_839_600;
+
+/// Entry point.
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if cli.bare {
+        compile_bare_repo(&cli.cache_dir, &cli.output, cli.limit)
+    } else {
+        compile_dir(&cli.cache_dir, &cli.output, cli.limit)
+    }
+}
+
+/// Compile XML directly into a bare Git repository.
+fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
+    let entries = render_ordinance_entries(cache_dir, limit)?;
+    if entries.is_empty() {
+        anyhow::bail!(
+            "no valid ordinance XML files found under {}",
+            cache_dir.display()
+        );
+    }
+
+    let mut repo = BareRepoWriter::create(output)?;
+    repo.commit_static(
+        &RepoPathBuf::root_file("README.md"),
+        REPOSITORY_README,
+        "initial commit",
+        INITIAL_COMMIT_EPOCH,
+    )?;
+    for entry in &entries {
+        let (blob_sha, compressed_blob) = precompute_blob(&entry.content);
+        repo.commit_bot_file(
+            &RepoPathBuf::file(&entry.path),
+            &entry.content,
+            blob_sha,
+            &compressed_blob,
+            &entry.message,
+            GitTimestampKst::from_epoch(entry.timestamp),
+        )?;
+    }
+    repo.finish()?;
+    eprintln!("committed {} ordinance markdown files", entries.len());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ImportEntry {
+    path: String,
+    content: Vec<u8>,
+    message: String,
+    timestamp: i64,
+    sort_date: String,
+    sort_id: u64,
+}
+
+fn render_ordinance_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<ImportEntry>> {
+    let mut files = read_xml_files(cache_dir)?;
+    if let Some(limit) = limit {
+        files.truncate(limit);
+    }
+    let mut registry = BTreeSet::new();
+    let mut entries = Vec::with_capacity(files.len());
+    let mut skipped = 0usize;
+    for path in files {
+        let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let ordinance = parse_ordinance(
+            &raw,
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
+        )?;
+        if !matches!(
+            ordinance.ordinance_type.as_str(),
+            "조례" | "규칙" | "훈령" | "예규" | "고시" | "의회규칙"
+        ) {
+            skipped += 1;
+            continue;
+        }
+        let rel = ordinance_path(&ordinance, &mut registry);
+        entries.push(ImportEntry {
+            path: rel.to_string_lossy().replace('\\', "/"),
+            content: render_markdown(&ordinance).into_bytes(),
+            message: ordinance_commit_message(&ordinance),
+            timestamp: commit_timestamp(&ordinance.prom_date_raw)?,
+            sort_date: compact_date_or_epoch(&ordinance.prom_date_raw),
+            sort_id: ordinance.id.parse::<u64>().unwrap_or(u64::MAX),
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.sort_date
+            .cmp(&b.sort_date)
+            .then_with(|| a.sort_id.cmp(&b.sort_id))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    eprintln!(
+        "prepared {} ordinance markdown files; skipped {skipped}",
+        entries.len()
+    );
+    Ok(entries)
+}
+
+fn ordinance_commit_message(ordinance: &Ordinance) -> String {
+    format!(
+        "{}: {} ({})\n\n자치법규ID: {}\n자치법규일련번호: {}",
+        ordinance.ordinance_type,
+        ordinance.name,
+        ordinance.jurisdiction,
+        ordinance.id,
+        ordinance.serial
+    )
+}
+
+fn compact_date_or_epoch(raw: &str) -> String {
+    let digits = raw.replace(['.', '-'], "");
+    if digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        if digits.as_str() < "19700101" {
+            "19700101".to_string()
+        } else {
+            digits
+        }
+    } else {
+        "19700101".to_string()
+    }
+}
+
+fn commit_timestamp(raw: &str) -> Result<i64> {
+    let date = compact_date_or_epoch(raw);
+    let year = date[0..4].parse::<i32>()?;
+    let month = Month::try_from(date[4..6].parse::<u8>()?)?;
+    let day = date[6..8].parse::<u8>()?;
+    let date = Date::from_calendar_date(year, month, day)?;
+    let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
+    Ok(datetime
+        .assume_offset(UtcOffset::from_hms(9, 0, 0)?)
+        .unix_timestamp())
+}
+
+/// Compile every XML file under `cache_dir`.
+fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
+    fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
+    fs::write(output.join("README.md"), REPOSITORY_README)?;
+    let mut files = read_xml_files(cache_dir)?;
+    if let Some(limit) = limit {
+        files.truncate(limit);
+    }
+    let mut registry = BTreeSet::new();
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for path in files {
+        let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let ordinance = parse_ordinance(
+            &raw,
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
+        )?;
+        if !matches!(
+            ordinance.ordinance_type.as_str(),
+            "조례" | "규칙" | "훈령" | "예규" | "고시" | "의회규칙"
+        ) {
+            skipped += 1;
+            continue;
+        }
+        let rel = ordinance_path(&ordinance, &mut registry);
+        let target = output.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, render_markdown(&ordinance))?;
+        written += 1;
+    }
+    eprintln!("written {written} ordinance markdown files; skipped {skipped}");
+    Ok(())
+}
+
+/// Return sorted XML files from a flat cache directory.
+fn read_xml_files(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(cache_dir)
+        .with_context(|| format!("failed to read {}", cache_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("xml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Parse a cached XML document.
+fn parse_ordinance(raw: &[u8], fallback_id: &str) -> Result<Ordinance> {
+    let fields = tag_texts(raw)?;
+    let id = first(&fields, &["자치법규ID"])
+        .unwrap_or(fallback_id)
+        .to_string();
+    Ok(Ordinance {
+        id,
+        serial: first(&fields, &["자치법규일련번호"])
+            .unwrap_or("")
+            .to_string(),
+        name: text_value(first(&fields, &["자치법규명"]).unwrap_or("")),
+        ordinance_type: normalize_type(first(&fields, &["자치법규종류"]).unwrap_or("")),
+        jurisdiction: text_value(first(&fields, &["지자체기관명"]).unwrap_or("")),
+        prom_date_raw: first(&fields, &["공포일자"]).unwrap_or("").to_string(),
+        prom_no: first(&fields, &["공포번호"]).unwrap_or("").to_string(),
+        effective_date_raw: first(&fields, &["시행일자"]).unwrap_or("").to_string(),
+        amendment: text_value(first(&fields, &["제개정구분명", "제개정구분"]).unwrap_or("")),
+        field: text_value(first(&fields, &["자치법규분야명"]).unwrap_or("")),
+        department: text_value(first(&fields, &["담당부서명"]).unwrap_or("")),
+        body: collect_body(&fields, &["조문내용", "조내용", "본문", "내용"]),
+        articles: collect_articles(&fields),
+        addenda: fields
+            .get("부칙내용")
+            .map(|values| values.iter().map(|value| nfc(value)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// Extract text values by tag.
+fn tag_texts(raw: &[u8]) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().trim_text(true);
+    let mut current = String::new();
+    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(event) => {
+                current = String::from_utf8_lossy(event.name().as_ref()).to_string()
+            }
+            Event::Text(text) if !current.is_empty() => {
+                let value = text.decode()?.trim().to_string();
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_default().push(value);
+                }
+            }
+            Event::CData(text) if !current.is_empty() => {
+                let value = text.decode()?.trim().to_string();
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_default().push(value);
+                }
+            }
+            Event::End(_) => current.clear(),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(fields)
+}
+
+/// Return first available field.
+fn first<'a>(fields: &'a BTreeMap<String, Vec<String>>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| fields.get(*key).and_then(|v| v.first().map(String::as_str)))
+}
+
+/// Collect body-like fields.
+fn collect_body(fields: &BTreeMap<String, Vec<String>>, keys: &[&str]) -> String {
+    let mut parts = Vec::new();
+    for key in keys {
+        if let Some(values) = fields.get(*key) {
+            parts.extend(values.iter().map(|v| nfc(v)));
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Collect article vectors by positional index. This matches the simple
+/// `조문단위` shape handled by the Python converter's shared article renderer.
+fn collect_articles(fields: &BTreeMap<String, Vec<String>>) -> Vec<Article> {
+    let numbers = fields.get("조문번호").cloned().unwrap_or_default();
+    let titles = fields
+        .get("조문제목")
+        .or_else(|| fields.get("조제목"))
+        .cloned()
+        .unwrap_or_default();
+    let contents = fields
+        .get("조문내용")
+        .or_else(|| fields.get("조내용"))
+        .cloned()
+        .unwrap_or_default();
+    contents
+        .iter()
+        .enumerate()
+        .map(|(idx, content)| Article {
+            no: numbers
+                .get(idx)
+                .map(|value| normalize_article_number(value))
+                .unwrap_or_default(),
+            title: titles.get(idx).cloned().unwrap_or_default(),
+            content: nfc(content),
+        })
+        .collect()
+}
+
+fn normalize_article_number(value: &str) -> String {
+    let raw = value.trim();
+    if let Ok(number) = raw.parse::<usize>() {
+        if number > 0 && number % 100 == 0 {
+            return (number / 100).to_string();
+        }
+        return number.to_string();
+    }
+    raw.to_string()
+}
+
+/// Normalize ordinance type code to label.
+fn normalize_type(value: &str) -> String {
+    match value {
+        "C0001" => "조례",
+        "C0002" => "규칙",
+        "C0003" => "훈령",
+        "C0004" => "예규",
+        "C0006" => "기타",
+        "C0010" => "고시",
+        "C0011" => "의회규칙",
+        other => other,
+    }
+    .to_string()
+}
+
+/// NFC-normalize.
+fn nfc(value: &str) -> String {
+    value.nfc().collect::<String>()
+}
+
+fn text_value(value: &str) -> String {
+    nfc(value).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Safe path component.
+fn safe_path_part(value: &str) -> String {
+    let mut text = text_value(value)
+        .replace(['\\', '/', ':', '\0', '"', '\'', '<', '>'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    while !text.is_empty() && text.len() > 180 {
+        text.pop();
+    }
+    if text.is_empty() {
+        "_".to_string()
+    } else {
+        text
+    }
+}
+
+/// Split jurisdiction into `(광역, 기초)`.
+fn split_jurisdiction(raw: &str) -> Result<(String, String)> {
+    const GWANGYEOK: [&str; 18] = [
+        "서울특별시",
+        "부산광역시",
+        "대구광역시",
+        "인천광역시",
+        "광주광역시",
+        "대전광역시",
+        "울산광역시",
+        "세종특별자치시",
+        "강원특별자치도",
+        "전북특별자치도",
+        "제주특별자치도",
+        "충청북도",
+        "충청남도",
+        "전라남도",
+        "경상북도",
+        "경상남도",
+        "경기도",
+        "충청광역연합",
+    ];
+    let text = nfc(raw)
+        .replace("제주도교육청", "제주특별자치도교육청")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for gwangyeok in GWANGYEOK {
+        if let Some(rest) = text.strip_prefix(gwangyeok) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return Ok((gwangyeok.to_string(), "_본청".to_string()));
+            }
+            if rest.ends_with("교육청") {
+                return Ok((gwangyeok.to_string(), "_교육청".to_string()));
+            }
+            return Ok((gwangyeok.to_string(), rest.to_string()));
+        }
+    }
+    anyhow::bail!("unknown jurisdiction: {raw}")
+}
+
+/// Compute repository path.
+fn ordinance_path(ordinance: &Ordinance, registry: &mut BTreeSet<String>) -> PathBuf {
+    let (gwangyeok, gicho) = split_jurisdiction(&ordinance.jurisdiction)
+        .unwrap_or_else(|_| ("_미상".to_string(), safe_path_part(&ordinance.jurisdiction)));
+    let gwangyeok = safe_path_part(&gwangyeok);
+    let gicho = safe_path_part(&gicho);
+    let ordinance_type = safe_path_part(&ordinance.ordinance_type);
+    let name = safe_path_part(&ordinance.name);
+    let base = format!("{gwangyeok}/{gicho}/{ordinance_type}/{name}/본문.md");
+    if registry.insert(base.clone()) {
+        return PathBuf::from(base);
+    }
+    let candidates = [
+        safe_path_part(&ordinance.prom_no),
+        safe_path_part(&ordinance.id),
+        safe_path_part(&format!("{}_{}", ordinance.prom_no, ordinance.id)),
+    ];
+    for suffix in candidates {
+        let suffixed = format!("{gwangyeok}/{gicho}/{ordinance_type}/{name}_{suffix}/본문.md");
+        if registry.insert(suffixed.clone()) {
+            return PathBuf::from(suffixed);
+        }
+    }
+    let mut idx = 2usize;
+    loop {
+        let suffixed = format!(
+            "{gwangyeok}/{gicho}/{ordinance_type}/{name}_{}_{idx}/본문.md",
+            ordinance.id
+        );
+        if registry.insert(suffixed.clone()) {
+            return PathBuf::from(suffixed);
+        }
+        idx += 1;
+    }
+}
+
+/// Convert compact dates to ISO dates.
+fn format_date(raw: &str) -> String {
+    let digits = raw.replace(['.', '-'], "");
+    if digits.len() == 8 && digits.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..8])
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Render article Markdown compatible with the Python converter for flat
+/// article bodies.
+fn render_articles(articles: &[Article]) -> String {
+    let mut parts = Vec::new();
+    for article in articles {
+        let title_suffix = if article.title.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", article.title)
+        };
+        parts.push(format!("##### 제{}조{}", article.no, title_suffix));
+        let stripped = strip_article_prefix(&article.content, &article.no, &article.title);
+        if !stripped.is_empty() {
+            parts.push(stripped);
+        }
+    }
+    parts.join("\n\n")
+}
+
+fn strip_article_prefix(content: &str, no: &str, title: &str) -> String {
+    if !no.is_empty() && !title.is_empty() {
+        let prefix = format!("제{}조({})", no, title);
+        if let Some(rest) = content.strip_prefix(&prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    content.trim().to_string()
+}
+
+/// Render Markdown.
+fn render_markdown(ordinance: &Ordinance) -> String {
+    let (gwangyeok, gicho) = split_jurisdiction(&ordinance.jurisdiction)
+        .unwrap_or_else(|_| ("_미상".to_string(), safe_path_part(&ordinance.jurisdiction)));
+    let articles = render_articles(&ordinance.articles);
+    let mut body_text = if !articles.trim().is_empty() {
+        articles
+    } else {
+        ordinance.body.trim().to_string()
+    };
+    for addendum in &ordinance.addenda {
+        let content = addendum.trim();
+        if !content.is_empty() {
+            if !body_text.trim().is_empty() {
+                body_text.push_str("\n\n");
+            }
+            body_text.push_str("## 부칙\n\n");
+            body_text.push_str(content);
+        }
+    }
+    let body = if body_text.trim().is_empty() {
+        "본문은 첨부파일(HWP)로 제공됩니다.".to_string()
+    } else {
+        body_text.trim().to_string()
+    };
+    let body_source = if body_text.trim().is_empty() {
+        "parsing-failed"
+    } else {
+        "api-text"
+    };
+    format!(
+        "---\n자치법규ID: {}\n자치법규일련번호: {}\n자치법규명: {}\nordinance_type: {}\njurisdiction: {}\njurisdiction_split:\n  광역: {}\n  기초: {}\n공포일자: {}\n공포번호: {}\n시행일자: {}\n제개정구분: {}\n자치법규분야: {}\n담당부서: {}\nbody_source: {}\nhwp_sha256: null\nattachments_hwp: false\n출처: {}\nsource_url: {}\nattachments: []\nepoch_clamped: false\n공포일자_raw: {}\n---\n\n# {}\n\n{}\n",
+        yaml_string(&ordinance.id),
+        yaml_string(&ordinance.serial),
+        yaml_string(&ordinance.name),
+        yaml_string(&ordinance.ordinance_type),
+        yaml_string(&ordinance.jurisdiction),
+        yaml_string(&gwangyeok),
+        yaml_string(&gicho),
+        format_date(&ordinance.prom_date_raw),
+        yaml_string(&ordinance.prom_no),
+        yaml_string(&format_date(&ordinance.effective_date_raw)),
+        yaml_string(&ordinance.amendment),
+        yaml_string(&ordinance.field),
+        yaml_string(&ordinance.department),
+        yaml_string(body_source),
+        yaml_string(&format!(
+            "https://www.law.go.kr/자치법규/{}",
+            ordinance.name.replace(' ', "")
+        )),
+        yaml_string(&format!(
+            "https://www.law.go.kr/DRF/lawService.do?target=ordin&ID={}",
+            ordinance.id
+        )),
+        yaml_string(&ordinance.prom_date_raw),
+        ordinance.name,
+        body
+    )
+}
+
+fn yaml_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn parses_code_type_and_jurisdiction() {
+        let xml = "<Ordin><자치법규ID>2000111</자치법규ID><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240504</공포일자><조문내용>제1조 목적</조문내용></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "2000111").unwrap();
+        assert_eq!(ordinance.ordinance_type, "조례");
+        assert!(render_markdown(&ordinance).contains("기초: '_본청'"));
+    }
+
+    #[test]
+    fn parses_observed_article_tags_and_extra_type_codes() {
+        let xml = "<Ordin><자치법규ID>2240395</자치법규ID><자치법규명>서울특별시 기준</자치법규명><자치법규종류>C0010</자치법규종류><지자체기관명>제주도교육청</지자체기관명><조><조문번호>000100</조문번호><조제목>목적</조제목><조내용>제1조(목적) 내용</조내용></조></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "2240395").unwrap();
+        assert_eq!(ordinance.ordinance_type, "고시");
+        assert_eq!(
+            split_jurisdiction(&ordinance.jurisdiction).unwrap(),
+            ("제주특별자치도".to_string(), "_교육청".to_string())
+        );
+        assert!(render_markdown(&ordinance).contains("##### 제1조 (목적)"));
+    }
+
+    #[test]
+    fn renders_addenda_when_articles_are_empty() {
+        let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>부칙 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><부칙><부칙내용>이 조례는 공포한 날부터 시행한다.</부칙내용></부칙></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
+        let markdown = render_markdown(&ordinance);
+        assert!(markdown.contains("body_source: 'api-text'"));
+        assert!(markdown.contains("## 부칙\n\n이 조례는 공포한 날부터 시행한다."));
+    }
+
+    #[test]
+    fn parses_cdata_fields() {
+        let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명><![CDATA[CDATA 조례]]></자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><조문내용><![CDATA[제1조 목적]]></조문내용></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
+        assert_eq!(ordinance.name, "CDATA 조례");
+        assert_eq!(ordinance.body, "제1조 목적");
+    }
+
+    #[test]
+    fn normalizes_and_quotes_yaml_sensitive_name() {
+        let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>서울특별시 옥외행사 안전관리에\n등에 관한 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><조문내용>제1조 목적</조문내용></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
+        assert_eq!(
+            ordinance.name,
+            "서울특별시 옥외행사 안전관리에 등에 관한 조례"
+        );
+        assert!(
+            render_markdown(&ordinance)
+                .contains("자치법규명: '서울특별시 옥외행사 안전관리에 등에 관한 조례'")
+        );
+    }
+
+    #[test]
+    fn bare_repo_uses_main_and_one_commit_per_ordinance() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("2000111.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>1</자치법규일련번호><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240504</공포일자><공포번호>1</공포번호><조문내용>제1조 목적</조문내용></Ordin>",
+        )
+        .unwrap();
+        let repo = temp.path().join("out.git");
+        compile_bare_repo(&cache, &repo, None).unwrap();
+        git_ok(&repo, ["fsck", "--full"]);
+        assert_eq!(git_stdout(&repo, ["rev-list", "--count", "--all"]), "2");
+        assert_eq!(
+            git_stdout(&repo, ["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert!(git_stdout(&repo, ["ls-tree", "-r", "--name-only", "HEAD"]).contains("본문.md"));
+
+        let checkout = temp.path().join("checkout");
+        let status = Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&repo)
+            .arg(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            checkout
+                .join("서울특별시/_본청/조례/서울특별시 테스트 조례/본문.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn bare_repo_rejects_empty_valid_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("2000111.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규명>기타</자치법규명><자치법규종류>C0006</자치법규종류></Ordin>",
+        )
+        .unwrap();
+        let repo = temp.path().join("out.git");
+        let error = compile_bare_repo(&cache, &repo, None).unwrap_err();
+        assert!(error.to_string().contains("no valid ordinance XML"));
+        assert!(!repo.exists());
+    }
+
+    #[test]
+    fn bare_repo_preserves_existing_output_when_planning_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("bad.xml"), "<Ordin><").unwrap();
+        let repo = temp.path().join("out.git");
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("marker"), "keep").unwrap();
+
+        let error = compile_bare_repo(&cache, &repo, None).unwrap_err();
+        assert!(error.to_string().contains("invalid") || error.to_string().contains("error"));
+        assert_eq!(fs::read_to_string(repo.join("marker")).unwrap(), "keep");
+    }
+
+    fn git_ok<const N: usize>(repo: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-c")
+            .arg("core.quotePath=false")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .arg("-c")
+            .arg("core.quotePath=false")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+}

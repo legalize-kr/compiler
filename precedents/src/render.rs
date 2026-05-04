@@ -8,10 +8,10 @@ use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::git_repo::RepoPathBuf;
 use crate::xml_parser::{
     MISSING_COURT_SENTINEL, MISSING_DATE_SENTINEL, PrecedentDetail, PrecedentMetadata,
 };
+use git_writer::RepoPathBuf;
 
 /// Slot separator for the composite filename grammar `{COURT}{SEP}{DATE}{SEP}{CASENO}`.
 ///

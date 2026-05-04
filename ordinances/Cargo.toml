@@ -1,0 +1,19 @@
+[package]
+name = "ordinance-kr-compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+git-writer = { path = "../git-writer" }
+quick-xml.workspace = true
+time.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "ordinance-kr-compiler"
+path = "src/main.rs"

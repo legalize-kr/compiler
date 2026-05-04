@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-crc32fast.workspace = true
+git-writer = { path = "../git-writer" }
 quick-xml.workspace = true
 rayon.workspace = true
 regex.workspace = true
@@ -14,20 +14,16 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-sha1.workspace = true
-smallvec.workspace = true
 time.workspace = true
 unicode-normalization.workspace = true
-zlib-rs.workspace = true
 
 mimalloc = { workspace = true, optional = true }
-libdeflater = { workspace = true, optional = true }
 
 [lib]
 doctest = false
 
 [features]
-default = ["dep:mimalloc", "dep:libdeflater"]
+default = ["dep:mimalloc"]
 
 [dev-dependencies]
 proptest.workspace = true

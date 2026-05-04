@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "admrule-kr-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "git-writer",
+ "quick-xml",
+ "tempfile",
+ "time",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,6 +332,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-writer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "libdeflater",
+ "sha1",
+ "smallvec",
+ "tempfile",
+ "zlib-rs",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -486,6 +512,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "ordinance-kr-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "git-writer",
+ "quick-xml",
+ "tempfile",
+ "time",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,8 +545,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "crc32fast",
- "libdeflater",
+ "git-writer",
  "mimalloc",
  "proptest",
  "quick-xml",
@@ -517,12 +555,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha1",
- "smallvec",
  "tempfile",
  "time",
  "unicode-normalization",
- "zlib-rs",
 ]
 
 [[package]]

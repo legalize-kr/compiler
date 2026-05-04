@@ -1,0 +1,22 @@
+[package]
+name = "git-writer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crc32fast.workspace = true
+sha1.workspace = true
+smallvec.workspace = true
+zlib-rs.workspace = true
+
+libdeflater = { workspace = true, optional = true }
+
+[lib]
+doctest = false
+
+[features]
+default = ["dep:libdeflater"]
+
+[dev-dependencies]
+tempfile.workspace = true

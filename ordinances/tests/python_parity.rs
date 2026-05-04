@@ -1,0 +1,95 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const SAMPLE_XML: &str = r#"<자치법규>
+  <자치법규ID>2000111</자치법규ID>
+  <자치법규일련번호>12345</자치법규일련번호>
+  <자치법규명>서울특별시 테스트 조례</자치법규명>
+  <자치법규종류>C0001</자치법규종류>
+  <지자체기관명>서울특별시</지자체기관명>
+  <공포일자>20210930</공포일자>
+  <공포번호>7825</공포번호>
+  <시행일자>20210930</시행일자>
+  <제개정구분명>일부개정</제개정구분명>
+  <자치법규분야명>일반공공행정</자치법규분야명>
+  <담당부서명>법무담당관</담당부서명>
+  <조문단위>
+    <조문번호>1</조문번호>
+    <조문제목>목적</조문제목>
+    <조문내용>제1조(목적) 이 조례는 테스트를 목적으로 한다.</조문내용>
+  </조문단위>
+</자치법규>"#;
+
+#[test]
+fn fixture_matches_python_pipeline_converter() {
+    if !pipeline_dir().join("ordinances").is_dir() {
+        eprintln!("skipping Python parity test: legalize-pipeline checkout not found");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let output_dir = temp.path().join("out");
+    fs::create_dir(&cache_dir).unwrap();
+    fs::write(cache_dir.join("2000111.xml"), SAMPLE_XML).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_ordinance-kr-compiler"))
+        .arg(&cache_dir)
+        .arg("-o")
+        .arg(&output_dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let (expected_path, expected_markdown) = python_reference(SAMPLE_XML);
+    let actual_path = output_dir.join(Path::new(&expected_path));
+    let actual_markdown = fs::read_to_string(&actual_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", actual_path.display()));
+
+    assert_eq!(actual_markdown, expected_markdown);
+}
+
+fn python_reference(xml: &str) -> (String, String) {
+    let pipeline = pipeline_dir();
+    let script = r#"
+import sys
+from ordinances import converter
+xml = sys.stdin.read()
+path, markdown = converter.xml_to_markdown(xml)
+print(path)
+print("===MARKDOWN===")
+print(markdown, end="")
+"#;
+    let output = Command::new("python")
+        .arg("-c")
+        .arg(script)
+        .env("PYTHONPATH", &pipeline)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.as_mut().unwrap().write_all(xml.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (path, markdown) = stdout.split_once("\n===MARKDOWN===\n").unwrap();
+    (path.to_string(), markdown.to_string())
+}
+
+fn pipeline_dir() -> PathBuf {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    repo_root.join("legalize-pipeline")
+}
