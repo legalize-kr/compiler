@@ -144,6 +144,6 @@ cargo zigbuild --no-default-features -r --target universal2-apple-darwin
 [Apache License (Version 2.0)] and the [MIT license]. See [COPYRIGHT] for
 details.
 
-[MIT license]: LICENSE-MIT
-[Apache License (Version 2.0)]: LICENSE-APACHE
-[COPYRIGHT]: COPYRIGHT
+[MIT license]: ../LICENSE-MIT
+[Apache License (Version 2.0)]: ../LICENSE-APACHE
+[COPYRIGHT]: ../COPYRIGHT

@@ -30,7 +30,7 @@ compiler/
 ## 빠른 시작
 
 ```bash
-# 워크스페이스 전체 빌드 (두 바이너리 동시 산출)
+# 워크스페이스 전체 빌드 (네 컴파일러 바이너리 동시 산출)
 cargo build --workspace --release
 
 # 법령 컴파일
@@ -72,6 +72,6 @@ git config core.hooksPath .githooks
 [Apache License (Version 2.0)] and the [MIT license]. See [COPYRIGHT] for
 details.
 
-[MIT license]: laws/LICENSE-MIT
-[Apache License (Version 2.0)]: laws/LICENSE-APACHE
-[COPYRIGHT]: laws/COPYRIGHT
+[MIT license]: LICENSE-MIT
+[Apache License (Version 2.0)]: LICENSE-APACHE
+[COPYRIGHT]: COPYRIGHT

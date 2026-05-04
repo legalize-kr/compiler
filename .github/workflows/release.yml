@@ -29,30 +29,31 @@ jobs:
           cargo zigbuild --workspace --no-default-features -r --target aarch64-unknown-linux-musl
           cargo zigbuild --workspace --no-default-features -r --target universal2-apple-darwin
 
-          # 두 바이너리 × 3 타겟 = 6 자산. 파일명은 통합 이전과 동일하게 보존하여
-          # legalize-pipeline/full-laws-import.yml 등 다운스트림 호출자가 변경 없이 동작.
-          for bin in legalize-kr-compiler precedent-kr-compiler; do
-            mv "target/aarch64-unknown-linux-musl/release/${bin}" "${bin}-aarch64-unknown-linux-musl"
-            mv "target/x86_64-unknown-linux-musl/release/${bin}" "${bin}-x86_64-unknown-linux-musl"
-            mv "target/universal2-apple-darwin/release/${bin}" "${bin}-universal2-apple-darwin"
+          bins=(
+            legalize-kr-compiler
+            precedent-kr-compiler
+            admrule-kr-compiler
+            ordinance-kr-compiler
+          )
+          targets=(
+            aarch64-unknown-linux-musl
+            x86_64-unknown-linux-musl
+            universal2-apple-darwin
+          )
+          assets=()
+
+          for bin in "${bins[@]}"; do
+            for target in "${targets[@]}"; do
+              asset="${bin}-${target}"
+              mv "target/${target}/release/${bin}" "${asset}"
+              assets+=("${asset}")
+            done
           done
 
-          tar -cvf binaries.tar \
-            legalize-kr-compiler-aarch64-unknown-linux-musl \
-            legalize-kr-compiler-x86_64-unknown-linux-musl \
-            legalize-kr-compiler-universal2-apple-darwin \
-            precedent-kr-compiler-aarch64-unknown-linux-musl \
-            precedent-kr-compiler-x86_64-unknown-linux-musl \
-            precedent-kr-compiler-universal2-apple-darwin
+          tar -cvf binaries.tar "${assets[@]}"
 
           VERSION="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           TAG="${VERSION}-$(date -u +%Y%m%d%H%M%S)"
           git tag "$TAG"
           git push origin "$TAG"
-          gh release create "$TAG" --title "$TAG" --generate-notes \
-            legalize-kr-compiler-aarch64-unknown-linux-musl \
-            legalize-kr-compiler-x86_64-unknown-linux-musl \
-            legalize-kr-compiler-universal2-apple-darwin \
-            precedent-kr-compiler-aarch64-unknown-linux-musl \
-            precedent-kr-compiler-x86_64-unknown-linux-musl \
-            precedent-kr-compiler-universal2-apple-darwin
+          gh release create "$TAG" --title "$TAG" --generate-notes "${assets[@]}"
