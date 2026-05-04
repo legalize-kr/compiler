@@ -109,5 +109,5 @@ cargo build -r --target aarch64-unknown-linux-musl
 *precedent-kr-compiler* is primarily distributed under the terms of both the
 [Apache License (Version 2.0)] and the [MIT license].
 
-[MIT license]: LICENSE-MIT
-[Apache License (Version 2.0)]: LICENSE-APACHE
+[MIT license]: ../LICENSE-MIT
+[Apache License (Version 2.0)]: ../LICENSE-APACHE
