@@ -6,7 +6,11 @@ on:
     paths-ignore:
       - "README.md"
       - "laws/README.md"
+      - "laws/assets/README.md"
       - "precedents/README.md"
+      - "precedents/assets/README.md"
+      - "admrules/assets/README.md"
+      - "ordinances/assets/README.md"
 
 jobs:
   release:

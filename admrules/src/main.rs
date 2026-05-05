@@ -1,6 +1,6 @@
 //! Compile cached law.go.kr administrative-rule XML into a Markdown tree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -137,12 +137,14 @@ struct ImportEntry {
     sort_id: u64,
 }
 
+type PathRegistry = BTreeMap<String, String>;
+
 fn render_admrule_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<ImportEntry>> {
     let mut files = read_xml_files(cache_dir)?;
     if let Some(limit) = limit {
         files.truncate(limit);
     }
-    let mut registry = BTreeSet::new();
+    let mut registry = PathRegistry::new();
     let mut entries = Vec::with_capacity(files.len());
     for path in files {
         let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -217,7 +219,7 @@ fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<
     if let Some(limit) = limit {
         files.truncate(limit);
     }
-    let mut registry = BTreeSet::new();
+    let mut registry = PathRegistry::new();
     let mut written = 0usize;
     for path in files {
         let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -735,13 +737,13 @@ fn safe_path_part(value: &str) -> String {
 }
 
 /// Compute repository path with collision suffixing.
-fn admrule_path(rule: &Admrule, registry: &mut BTreeSet<String>) -> PathBuf {
+fn admrule_path(rule: &Admrule, registry: &mut PathRegistry) -> PathBuf {
     let org_parts = admrule_org_path_parts(rule);
     let rule_type = safe_path_part(&rule.rule_type);
     let name = safe_path_part(&rule.name);
     let prefix = org_parts.join("/");
     let base = format!("{prefix}/{rule_type}/{name}/본문.md");
-    if registry.insert(base.clone()) {
+    if claim_path(registry, &base, &rule.serial) {
         return PathBuf::from(base);
     }
     let first_suffix = if rule.issue_no.is_empty() {
@@ -756,17 +758,28 @@ fn admrule_path(rule: &Admrule, registry: &mut BTreeSet<String>) -> PathBuf {
     ];
     for suffix in candidates {
         let suffixed = format!("{prefix}/{rule_type}/{name}_{suffix}/본문.md");
-        if registry.insert(suffixed.clone()) {
+        if claim_path(registry, &suffixed, &rule.serial) {
             return PathBuf::from(suffixed);
         }
     }
     let mut idx = 2usize;
     loop {
         let suffixed = format!("{prefix}/{rule_type}/{name}_{}_{idx}/본문.md", rule.serial);
-        if registry.insert(suffixed.clone()) {
+        if claim_path(registry, &suffixed, &rule.serial) {
             return PathBuf::from(suffixed);
         }
         idx += 1;
+    }
+}
+
+fn claim_path(registry: &mut PathRegistry, path: &str, identity: &str) -> bool {
+    match registry.get(path) {
+        None => {
+            registry.insert(path.to_string(), identity.to_string());
+            true
+        }
+        Some(existing) if existing == identity => true,
+        Some(_) => false,
     }
 }
 
@@ -926,6 +939,33 @@ mod tests {
     }
 
     #[test]
+    fn path_registry_reuses_path_for_same_rule_serial_revisions() {
+        let first = parse_admrule(
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>같은 이름</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령번호>제1호</발령번호></AdmRulService>".as_bytes(),
+            "123",
+        )
+        .unwrap();
+        let second = parse_admrule(
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>같은 이름</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령번호>제2호</발령번호></AdmRulService>".as_bytes(),
+            "123",
+        )
+        .unwrap();
+        let other = parse_admrule(
+            "<AdmRulService><행정규칙일련번호>456</행정규칙일련번호><행정규칙명>같은 이름</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령번호>제3호</발령번호></AdmRulService>".as_bytes(),
+            "456",
+        )
+        .unwrap();
+        let mut registry = PathRegistry::new();
+        let base = PathBuf::from("행정안전부/_본부/고시/같은 이름/본문.md");
+        assert_eq!(admrule_path(&first, &mut registry), base);
+        assert_eq!(admrule_path(&second, &mut registry), base);
+        assert_eq!(
+            admrule_path(&other, &mut registry),
+            PathBuf::from("행정안전부/_본부/고시/같은 이름_제3호/본문.md")
+        );
+    }
+
+    #[test]
     fn parses_cdata_fields() {
         let xml = "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명><![CDATA[CDATA 고시]]></행정규칙명><조문내용><![CDATA[제1조 목적]]></조문내용></AdmRulService>";
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
@@ -979,7 +1019,7 @@ mod tests {
         assert_eq!(rule.top_ministry, "국토교통부");
         assert_eq!(rule.ministry, "제주지방항공청");
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("국토교통부/제주지방항공청/훈령/제주지방항공청 사무분장 규정/본문.md")
         );
     }
@@ -1003,7 +1043,7 @@ mod tests {
         assert_eq!(rule.ministry, "국립환경과학원");
         assert_eq!(rule.original_ministry, "환경보건정책과");
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from(
                 "기후에너지환경부/국립환경과학원/고시/위해성평가 실시 등의 대상이 되는 환경유해인자의 목록/본문.md"
             )
@@ -1018,7 +1058,7 @@ mod tests {
         assert_eq!(rule.ministry, "해양수산부");
         assert_eq!(rule.original_ministry, "국토해양부");
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("해양수산부/_본부/고시/무인도서 관리유형 재지정(변경) 고시/본문.md")
         );
     }
@@ -1031,7 +1071,7 @@ mod tests {
         assert_eq!(own_rule.ministry, "병무청");
         assert_eq!(own_rule.org_path, ["국방부", "병무청"]);
         assert_eq!(
-            admrule_path(&own_rule, &mut BTreeSet::new()),
+            admrule_path(&own_rule, &mut PathRegistry::new()),
             PathBuf::from("국방부/병무청/예규/병무청 예규/본문.md")
         );
 
@@ -1042,7 +1082,7 @@ mod tests {
             ["농림축산식품부", "산림청", "국립산림과학원"]
         );
         assert_eq!(
-            admrule_path(&sub_rule, &mut BTreeSet::new()),
+            admrule_path(&sub_rule, &mut PathRegistry::new()),
             PathBuf::from("농림축산식품부/산림청/국립산림과학원/훈령/국립산림과학원 훈령/본문.md")
         );
     }
@@ -1081,7 +1121,7 @@ mod tests {
         let law_rule = parse_admrule(law_xml.as_bytes(), "123").unwrap();
         assert_eq!(law_rule.org_path, ["국무총리", "법제처"]);
         assert_eq!(
-            admrule_path(&law_rule, &mut BTreeSet::new()),
+            admrule_path(&law_rule, &mut PathRegistry::new()),
             PathBuf::from("국무총리/법제처/훈령/법제처 훈령/본문.md")
         );
 
@@ -1089,7 +1129,7 @@ mod tests {
         let education_rule = parse_admrule(education_xml.as_bytes(), "124").unwrap();
         assert_eq!(education_rule.org_path, ["대통령", "국가교육위원회"]);
         assert_eq!(
-            admrule_path(&education_rule, &mut BTreeSet::new()),
+            admrule_path(&education_rule, &mut PathRegistry::new()),
             PathBuf::from("대통령/국가교육위원회/고시/국가교육위원회 규칙/본문.md")
         );
 
@@ -1100,7 +1140,7 @@ mod tests {
             ["대통령", "방송미디어통신위원회", "방송미디어통신사무소"]
         );
         assert_eq!(
-            admrule_path(&office_rule, &mut BTreeSet::new()),
+            admrule_path(&office_rule, &mut PathRegistry::new()),
             PathBuf::from(
                 "대통령/방송미디어통신위원회/방송미디어통신사무소/훈령/방송미디어통신사무소 세칙/본문.md"
             )
@@ -1113,7 +1153,7 @@ mod tests {
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
         assert_eq!(rule.org_path, ["국방부"]);
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("국방부/_본부/훈령/국방전자기스펙트럼 업무 훈령/본문.md")
         );
     }
@@ -1124,7 +1164,7 @@ mod tests {
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
         assert_eq!(rule.org_path, ["기후에너지환경부"]);
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("기후에너지환경부/_본부/고시/전력산업 고시/본문.md")
         );
     }
@@ -1135,7 +1175,7 @@ mod tests {
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
         assert_eq!(rule.org_path, ["과학기술정보통신부"]);
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("과학기술정보통신부/_본부/공고/이동통신 주파수 할당/본문.md")
         );
     }
@@ -1156,7 +1196,7 @@ mod tests {
             ["10·29이태원참사진상규명과재발방지를위한특별조사위원회"]
         );
         assert_eq!(
-            admrule_path(&rule, &mut BTreeSet::new()),
+            admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from(
                 "10·29이태원참사진상규명과재발방지를위한특별조사위원회/_본부/고시/10·29 위원회 규칙/본문.md"
             )

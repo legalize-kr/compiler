@@ -1,6 +1,6 @@
 //! Compile cached law.go.kr ordinance XML into a Markdown tree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -141,12 +141,14 @@ struct ImportEntry {
     sort_id: u64,
 }
 
+type PathRegistry = BTreeMap<String, String>;
+
 fn render_ordinance_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<ImportEntry>> {
     let mut files = read_xml_files(cache_dir)?;
     if let Some(limit) = limit {
         files.truncate(limit);
     }
-    let mut registry = BTreeSet::new();
+    let mut registry = PathRegistry::new();
     let mut entries = Vec::with_capacity(files.len());
     let mut skipped = 0usize;
     for path in files {
@@ -239,7 +241,7 @@ fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<
     if let Some(limit) = limit {
         files.truncate(limit);
     }
-    let mut registry = BTreeSet::new();
+    let mut registry = PathRegistry::new();
     let mut written = 0usize;
     let mut skipped = 0usize;
     for path in files {
@@ -572,7 +574,7 @@ fn split_jurisdiction(raw: &str) -> Result<(String, String)> {
 }
 
 /// Compute repository path.
-fn ordinance_path(ordinance: &Ordinance, registry: &mut BTreeSet<String>) -> PathBuf {
+fn ordinance_path(ordinance: &Ordinance, registry: &mut PathRegistry) -> PathBuf {
     let (gwangyeok, gicho) = split_jurisdiction(&ordinance.jurisdiction)
         .unwrap_or_else(|_| ("_미상".to_string(), safe_path_part(&ordinance.jurisdiction)));
     let gwangyeok = safe_path_part(&gwangyeok);
@@ -580,7 +582,7 @@ fn ordinance_path(ordinance: &Ordinance, registry: &mut BTreeSet<String>) -> Pat
     let ordinance_type = safe_path_part(&ordinance.ordinance_type);
     let name = safe_path_part(&ordinance.name);
     let base = format!("{gwangyeok}/{gicho}/{ordinance_type}/{name}/본문.md");
-    if registry.insert(base.clone()) {
+    if claim_path(registry, &base, &ordinance.id) {
         return PathBuf::from(base);
     }
     let candidates = [
@@ -590,7 +592,7 @@ fn ordinance_path(ordinance: &Ordinance, registry: &mut BTreeSet<String>) -> Pat
     ];
     for suffix in candidates {
         let suffixed = format!("{gwangyeok}/{gicho}/{ordinance_type}/{name}_{suffix}/본문.md");
-        if registry.insert(suffixed.clone()) {
+        if claim_path(registry, &suffixed, &ordinance.id) {
             return PathBuf::from(suffixed);
         }
     }
@@ -600,10 +602,21 @@ fn ordinance_path(ordinance: &Ordinance, registry: &mut BTreeSet<String>) -> Pat
             "{gwangyeok}/{gicho}/{ordinance_type}/{name}_{}_{idx}/본문.md",
             ordinance.id
         );
-        if registry.insert(suffixed.clone()) {
+        if claim_path(registry, &suffixed, &ordinance.id) {
             return PathBuf::from(suffixed);
         }
         idx += 1;
+    }
+}
+
+fn claim_path(registry: &mut PathRegistry, path: &str, identity: &str) -> bool {
+    match registry.get(path) {
+        None => {
+            registry.insert(path.to_string(), identity.to_string());
+            true
+        }
+        Some(existing) if existing == identity => true,
+        Some(_) => false,
     }
 }
 
@@ -752,6 +765,33 @@ mod tests {
         assert_eq!(ordinance.ordinance_type, "조례");
         assert!(render_markdown(&ordinance).contains("기초: '_본청'"));
         assert!(!render_markdown(&ordinance).contains("source_url:"));
+    }
+
+    #[test]
+    fn path_registry_reuses_path_for_same_ordinance_id_revisions() {
+        let first = parse_ordinance(
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포번호>100</공포번호></Ordin>".as_bytes(),
+            "2000111",
+        )
+        .unwrap();
+        let second = parse_ordinance(
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포번호>101</공포번호></Ordin>".as_bytes(),
+            "2000111",
+        )
+        .unwrap();
+        let other = parse_ordinance(
+            "<Ordin><자치법규ID>2000222</자치법규ID><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포번호>102</공포번호></Ordin>".as_bytes(),
+            "2000222",
+        )
+        .unwrap();
+        let mut registry = PathRegistry::new();
+        let base = PathBuf::from("서울특별시/_본청/조례/서울특별시 테스트 조례/본문.md");
+        assert_eq!(ordinance_path(&first, &mut registry), base);
+        assert_eq!(ordinance_path(&second, &mut registry), base);
+        assert_eq!(
+            ordinance_path(&other, &mut registry),
+            PathBuf::from("서울특별시/_본청/조례/서울특별시 테스트 조례_102/본문.md")
+        );
     }
 
     #[test]
