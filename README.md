@@ -40,11 +40,21 @@ cargo build --workspace --release
 ./target/release/precedent-kr-compiler ../.cache/precedent -o ./precedent-output.git
 
 # 행정규칙 컴파일
-./target/release/admrule-kr-compiler ../.cache/admrule -o ./admrule-output.git --bare
+./target/release/admrule-kr-compiler ../.cache/admrule -o ./admrule-output.git
 
 # 자치법규 컴파일
-./target/release/ordinance-kr-compiler ../.cache/ordinance -o ./ordinance-output.git --bare
+./target/release/ordinance-kr-compiler ../.cache/ordinance -o ./ordinance-output.git
+
+# 공통 점검/메타데이터 옵션
+./target/release/legalize-kr-compiler ../.cache --validate
+./target/release/precedent-kr-compiler ../.cache/precedent --manifest ./manifest.json
 ```
+
+네 컴파일러 모두 기본 출력은 bare Git 저장소이며, `-o/--output`을 생략하면
+`output.git`에 씁니다. `--validate`는 저장소를 쓰지 않고 JSON 점검 결과만
+표준 출력으로 내보내며, `--manifest`는 빌드 결과의 `HEAD`와 엔트리 수를 JSON으로
+기록합니다. 행정규칙/자치법규 컴파일러의 기존 Markdown tree 출력은
+`--tree`로 사용할 수 있습니다.
 
 ## CI 4종 게이트
 

@@ -9,7 +9,7 @@
 
 ## 사용법
 ```bash
-legalize-kr-compiler <input_cache_dir> [-o <output_git_dir>]
+legalize-kr-compiler <input_cache_dir> [-o <output_git_dir>] [--validate] [--manifest <path>]
 ```
 
 기본 출력 경로는 `./output.git`입니다. 결과물은 bare repo이므로 내용을 보려면
@@ -26,6 +26,9 @@ cd legalize-kr
 ```bash
 legalize-kr-compiler ../.cache -o ./another.git
 ```
+
+저장소를 쓰기 전에 캐시 상태만 JSON으로 확인하려면 `--validate`를 사용합니다.
+빌드 결과의 `HEAD`와 엔트리 수는 `--manifest <path>`로 기록할 수 있습니다.
 
 ## 동작 방식
 

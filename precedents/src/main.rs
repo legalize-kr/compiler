@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
+use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, hex, precompute_blob};
 use rayon::prelude::*;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
@@ -51,6 +51,14 @@ struct Cli {
     #[arg(short = 'o', long = "output", default_value = "output.git")]
     output: PathBuf,
 
+    /// Pre-flight validation only: scan cache, emit JSON report, skip repo writes.
+    #[arg(long)]
+    validate: bool,
+
+    /// Emit build manifest JSON to this path. Default: no manifest.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
     /// Optional path to write a `legacy-paths.json` mapping the legacy single-key
     /// precedent-kr filenames to the new composite-key filenames. Used by Phase 4
     /// diff harness, cli-tools fallback lookup, and legalize-web redirect table.
@@ -62,6 +70,28 @@ struct Cli {
     /// `old_path: null` in the emission (per plan §3 Phase 3 schema).
     #[arg(long = "legacy-precedent-root")]
     legacy_precedent_root: Option<PathBuf>,
+}
+
+/// Minimal build manifest shared by non-law compilers.
+#[derive(Debug, serde::Serialize)]
+struct BuildManifest {
+    /// Manifest schema version.
+    schema_version: u8,
+    /// Final HEAD commit SHA, or an empty string in validate mode.
+    head_commit_sha: String,
+    /// Number of rendered entries.
+    entries_total: usize,
+}
+
+/// Pre-flight validation report.
+#[derive(Debug, serde::Serialize)]
+struct ValidationReport {
+    /// Report schema version.
+    schema_version: u8,
+    /// Number of XML files under the input cache directory.
+    total_xml: usize,
+    /// Number of entries that can be rendered.
+    entries_total: usize,
 }
 
 /// Pass-1 planning record for one XML document.
@@ -189,6 +219,28 @@ fn run(cli: Cli) -> Result<()> {
 
         entries
     };
+    if cli.validate {
+        let total_xml = read_sorted_files(&cache_dir, "xml")?.len();
+        let report = ValidationReport {
+            schema_version: 1,
+            total_xml,
+            entries_total: entries.len(),
+        };
+        let json = serde_json::to_string_pretty(&report)
+            .context("failed to serialize validation report as JSON")?;
+        println!("{json}");
+        if let Some(path) = &cli.manifest {
+            write_manifest(
+                path,
+                &BuildManifest {
+                    schema_version: 1,
+                    head_commit_sha: String::new(),
+                    entries_total: entries.len(),
+                },
+            )?;
+        }
+        return Ok(());
+    }
     if entries.is_empty() {
         anyhow::bail!(
             "no valid precedent XML files found under {}",
@@ -274,13 +326,30 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     eprintln!("3. Finalizing pack + index");
-    repo.finish()?;
+    let head_sha = repo.finish()?;
+    if let Some(path) = &cli.manifest {
+        write_manifest(
+            path,
+            &BuildManifest {
+                schema_version: 1,
+                head_commit_sha: hex(&head_sha),
+                entries_total: entries.len(),
+            },
+        )?;
+    }
 
     if let Some(emit_path) = cli.emit_legacy_paths.as_ref() {
         write_legacy_paths_json(emit_path, &entries, cli.legacy_precedent_root.as_deref())?;
     }
 
     Ok(())
+}
+
+/// Writes a pretty-printed manifest JSON payload.
+fn write_manifest(path: &Path, manifest: &BuildManifest) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)
+        .context("failed to serialize build manifest as JSON")?;
+    fs::write(path, json).with_context(|| format!("failed to write manifest to {}", path.display()))
 }
 
 /// JSON entry written to `legacy-paths.json` (see plan §3 Phase 3 schema).
@@ -495,6 +564,8 @@ mod tests {
         run(Cli {
             cache_dir: cache_dir.clone(),
             output: output.clone(),
+            validate: false,
+            manifest: None,
             emit_legacy_paths: None,
             legacy_precedent_root: None,
         })
@@ -553,6 +624,8 @@ mod tests {
         run(Cli {
             cache_dir,
             output: temp.path().join("output.git"),
+            validate: false,
+            manifest: None,
             emit_legacy_paths: Some(legacy_paths.clone()),
             legacy_precedent_root: Some(legacy_root),
         })
@@ -601,6 +674,8 @@ mod tests {
         run(Cli {
             cache_dir,
             output: output.clone(),
+            validate: false,
+            manifest: None,
             emit_legacy_paths: None,
             legacy_precedent_root: None,
         })

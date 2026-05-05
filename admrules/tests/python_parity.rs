@@ -48,6 +48,7 @@ fn fixture_matches_python_pipeline_converter() {
         .arg(&cache_dir)
         .arg("-o")
         .arg(&output_dir)
+        .arg("--tree")
         .status()
         .unwrap();
     assert!(status.success());

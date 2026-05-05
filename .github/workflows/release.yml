@@ -29,15 +29,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cargo zigbuild --workspace --no-default-features -r --target x86_64-unknown-linux-musl
-          cargo zigbuild --workspace --no-default-features -r --target aarch64-unknown-linux-musl
-          cargo zigbuild --workspace --no-default-features -r --target universal2-apple-darwin
-
           bins=(
             legalize-kr-compiler
             precedent-kr-compiler
             admrule-kr-compiler
             ordinance-kr-compiler
+          )
+          manifests=(
+            laws/Cargo.toml
+            precedents/Cargo.toml
+            admrules/Cargo.toml
+            ordinances/Cargo.toml
           )
           targets=(
             aarch64-unknown-linux-musl
@@ -45,6 +47,12 @@ jobs:
             universal2-apple-darwin
           )
           assets=()
+
+          for manifest in "${manifests[@]}"; do
+            for target in "${targets[@]}"; do
+              cargo zigbuild --manifest-path "${manifest}" --no-default-features -r --target "${target}"
+            done
+          done
 
           for bin in "${bins[@]}"; do
             for target in "${targets[@]}"; do

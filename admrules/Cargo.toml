@@ -6,10 +6,15 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-git-writer = { path = "../git-writer" }
+git-writer = { path = "../git-writer", default-features = false }
 quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 unicode-normalization.workspace = true
+
+[features]
+default = ["git-writer/libdeflater"]
 
 [dev-dependencies]
 tempfile.workspace = true

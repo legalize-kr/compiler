@@ -1,4 +1,4 @@
-//! Compile cached law.go.kr administrative-rule XML into a Markdown tree.
+//! Compile cached law.go.kr administrative-rule XML into a bare Git repository.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use git_writer::{BareRepoWriter, GitTimestampKst, PreparedBlob, RepoPathBuf, precompute_blob};
+use git_writer::{
+    BareRepoWriter, GitTimestampKst, PreparedBlob, RepoPathBuf, hex, precompute_blob,
+};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use serde::Serialize;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 use unicode_normalization::UnicodeNormalization;
 
@@ -17,18 +20,52 @@ const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
 /// Command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "admrule-kr-compiler")]
+#[command(
+    about = "Compile cached law.go.kr administrative-rule XML into a fresh bare Git repository"
+)]
 struct Cli {
-    /// Directory containing `{행정규칙일련번호}.xml` files.
+    /// Path to the existing `.cache/admrule/` directory.
     cache_dir: PathBuf,
-    /// Output Markdown tree directory.
-    #[arg(short = 'o', long = "output")]
+    /// Output bare repository path.
+    #[arg(short = 'o', long = "output", default_value = "output.git")]
     output: PathBuf,
+    /// Pre-flight validation only: scan cache, emit JSON report, skip repo writes.
+    #[arg(long, conflicts_with = "tree")]
+    validate: bool,
+    /// Emit build manifest JSON to this path. Default: no manifest.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
     /// Limit input files for probe runs.
     #[arg(long)]
     limit: Option<usize>,
-    /// Write a bare Git repository instead of a Markdown tree.
+    /// Write a Markdown tree directory instead of a bare Git repository.
     #[arg(long)]
-    bare: bool,
+    tree: bool,
+    /// Backward-compatible no-op: bare repository output is now the default.
+    #[arg(long = "bare", hide = true, conflicts_with = "tree")]
+    _bare: bool,
+}
+
+/// Minimal build manifest shared by non-law compilers.
+#[derive(Debug, Serialize)]
+struct BuildManifest {
+    /// Manifest schema version.
+    schema_version: u8,
+    /// Final HEAD commit SHA, or an empty string in validate mode.
+    head_commit_sha: String,
+    /// Number of rendered entries.
+    entries_total: usize,
+}
+
+/// Pre-flight validation report.
+#[derive(Debug, Serialize)]
+struct ValidationReport {
+    /// Report schema version.
+    schema_version: u8,
+    /// Number of XML files under the input cache directory.
+    total_xml: usize,
+    /// Number of entries that can be rendered.
+    entries_total: usize,
 }
 
 /// Parsed administrative-rule metadata and body.
@@ -86,16 +123,44 @@ const INITIAL_COMMIT_EPOCH: i64 = 1_774_839_600;
 
 /// Entry point.
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if cli.bare {
-        compile_bare_repo(&cli.cache_dir, &cli.output, cli.limit)
-    } else {
+    run(Cli::parse())
+}
+
+/// Executes the requested compiler mode.
+fn run(cli: Cli) -> Result<()> {
+    if cli.validate {
+        validate_cache(&cli.cache_dir, cli.limit, cli.manifest.as_deref())
+    } else if cli.tree {
+        if let Some(path) = &cli.manifest {
+            anyhow::bail!(
+                "--manifest is only supported for bare repository builds or --validate: {}",
+                path.display()
+            );
+        }
         compile_dir(&cli.cache_dir, &cli.output, cli.limit)
+    } else {
+        compile_bare_repo_with_manifest(
+            &cli.cache_dir,
+            &cli.output,
+            cli.limit,
+            cli.manifest.as_deref(),
+        )
     }
 }
 
 /// Compile XML directly into a bare Git repository.
+#[cfg(test)]
 fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
+    compile_bare_repo_with_manifest(cache_dir, output, limit, None)
+}
+
+/// Compile XML directly into a bare Git repository, optionally writing a manifest.
+fn compile_bare_repo_with_manifest(
+    cache_dir: &Path,
+    output: &Path,
+    limit: Option<usize>,
+    manifest: Option<&Path>,
+) -> Result<()> {
     let entries = render_admrule_entries(cache_dir, limit)?;
     if entries.is_empty() {
         anyhow::bail!(
@@ -132,9 +197,51 @@ fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> R
             )?;
         }
     }
-    repo.finish()?;
+    let head_sha = repo.finish()?;
+    if let Some(path) = manifest {
+        write_manifest(
+            path,
+            &BuildManifest {
+                schema_version: 1,
+                head_commit_sha: hex(&head_sha),
+                entries_total: entries.len(),
+            },
+        )?;
+    }
     eprintln!("committed {} admrule markdown files", entries.len());
     Ok(())
+}
+
+/// Scans input cache and emits a JSON validation report without writing output.
+fn validate_cache(cache_dir: &Path, limit: Option<usize>, manifest: Option<&Path>) -> Result<()> {
+    let total_xml = read_xml_files(cache_dir)?.len();
+    let entries = render_admrule_entries(cache_dir, limit)?;
+    let report = ValidationReport {
+        schema_version: 1,
+        total_xml,
+        entries_total: entries.len(),
+    };
+    let json = serde_json::to_string_pretty(&report)
+        .context("failed to serialize validation report as JSON")?;
+    println!("{json}");
+    if let Some(path) = manifest {
+        write_manifest(
+            path,
+            &BuildManifest {
+                schema_version: 1,
+                head_commit_sha: String::new(),
+                entries_total: entries.len(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes a pretty-printed manifest JSON payload.
+fn write_manifest(path: &Path, manifest: &BuildManifest) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)
+        .context("failed to serialize build manifest as JSON")?;
+    fs::write(path, json).with_context(|| format!("failed to write manifest to {}", path.display()))
 }
 
 #[derive(Debug)]

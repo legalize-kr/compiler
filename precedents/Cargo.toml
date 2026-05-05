@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-git-writer = { path = "../git-writer" }
+git-writer = { path = "../git-writer", default-features = false }
 quick-xml.workspace = true
 rayon.workspace = true
 regex.workspace = true
@@ -23,7 +23,7 @@ mimalloc = { workspace = true, optional = true }
 doctest = false
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "git-writer/libdeflater"]
 mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
