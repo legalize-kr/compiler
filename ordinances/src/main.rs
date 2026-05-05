@@ -151,10 +151,20 @@ fn render_ordinance_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Ve
     let mut skipped = 0usize;
     for path in files {
         let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let ordinance = parse_ordinance(
+        let ordinance = match parse_ordinance(
             &raw,
             path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
-        )?;
+        ) {
+            Ok(ordinance) => ordinance,
+            Err(err) => {
+                skipped += 1;
+                eprintln!(
+                    "skipping unparsable ordinance XML {}: {err:#}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         if !matches!(
             ordinance.ordinance_type.as_str(),
             "조례" | "규칙" | "훈령" | "예규" | "고시" | "의회규칙"
@@ -234,10 +244,20 @@ fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<
     let mut skipped = 0usize;
     for path in files {
         let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let ordinance = parse_ordinance(
+        let ordinance = match parse_ordinance(
             &raw,
             path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
-        )?;
+        ) {
+            Ok(ordinance) => ordinance,
+            Err(err) => {
+                skipped += 1;
+                eprintln!(
+                    "skipping unparsable ordinance XML {}: {err:#}",
+                    path.display()
+                );
+                continue;
+            }
+        };
         if !matches!(
             ordinance.ordinance_type.as_str(),
             "조례" | "규칙" | "훈령" | "예규" | "고시" | "의회규칙"
@@ -842,7 +862,25 @@ mod tests {
     }
 
     #[test]
-    fn bare_repo_preserves_existing_output_when_planning_fails() {
+    fn bare_repo_skips_unparsable_xml_without_aborting_valid_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("bad.xml"), "<Ordin><").unwrap();
+        fs::write(
+            cache.join("2000111.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>1</자치법규일련번호><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240504</공포일자><공포번호>1</공포번호><조문내용>제1조 목적</조문내용></Ordin>",
+        )
+        .unwrap();
+        let repo = temp.path().join("out.git");
+
+        compile_bare_repo(&cache, &repo, None).unwrap();
+        git_ok(&repo, ["fsck", "--full"]);
+        assert_eq!(git_stdout(&repo, ["rev-list", "--count", "--all"]), "2");
+    }
+
+    #[test]
+    fn bare_repo_preserves_existing_output_when_no_valid_entries_exist() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("cache");
         fs::create_dir(&cache).unwrap();
@@ -852,7 +890,7 @@ mod tests {
         fs::write(repo.join("marker"), "keep").unwrap();
 
         let error = compile_bare_repo(&cache, &repo, None).unwrap_err();
-        assert!(error.to_string().contains("invalid") || error.to_string().contains("error"));
+        assert!(error.to_string().contains("no valid ordinance XML"));
         assert_eq!(fs::read_to_string(repo.join("marker")).unwrap(), "keep");
     }
 

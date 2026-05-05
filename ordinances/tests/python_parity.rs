@@ -33,10 +33,15 @@ const SAMPLE_XML: &str = r#"<자치법규>
 
 #[test]
 fn fixture_matches_python_pipeline_converter() {
-    if !pipeline_dir().join("ordinances").is_dir() {
+    let Some(pipeline) = pipeline_dir() else {
         eprintln!("skipping Python parity test: legalize-pipeline checkout not found");
         return;
-    }
+    };
+    assert!(
+        pipeline.join("ordinances").is_dir(),
+        "legalize-pipeline checkout does not contain ordinances/: {}",
+        pipeline.display()
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let cache_dir = temp.path().join("cache");
@@ -61,7 +66,7 @@ fn fixture_matches_python_pipeline_converter() {
 }
 
 fn python_reference(xml: &str) -> (String, String) {
-    let pipeline = pipeline_dir();
+    let pipeline = pipeline_dir().expect("legalize-pipeline checkout is required");
     let script = r#"
 import sys
 from ordinances import converter
@@ -71,7 +76,7 @@ print(path)
 print("===MARKDOWN===")
 print(markdown, end="")
 "#;
-    let output = Command::new("python")
+    let output = Command::new(std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string()))
         .arg("-c")
         .arg(script)
         .env("PYTHONPATH", &pipeline)
@@ -94,12 +99,21 @@ print(markdown, end="")
     (path.to_string(), markdown.to_string())
 }
 
-fn pipeline_dir() -> PathBuf {
+fn pipeline_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("LEGALIZE_PIPELINE_ROOT") {
+        return Some(PathBuf::from(path));
+    }
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap()
         .to_path_buf();
-    repo_root.join("legalize-pipeline")
+    let mut candidates = vec![repo_root.join("legalize-pipeline")];
+    if let Some(parent) = repo_root.parent() {
+        candidates.push(parent.join("legalize-pipeline"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.join("ordinances").is_dir())
 }
