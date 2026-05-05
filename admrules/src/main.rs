@@ -823,7 +823,7 @@ fn admrule_org_path_parts(rule: &Admrule) -> Vec<String> {
 /// Convert compact dates to ISO dates.
 fn format_date(raw: &str) -> String {
     let digits = raw.replace(['.', '-'], "");
-    if digits.len() == 8 && digits.chars().all(|c| c.is_ascii_digit()) {
+    if is_valid_compact_date(&digits) {
         format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..8])
     } else {
         raw.to_string()
@@ -832,11 +832,14 @@ fn format_date(raw: &str) -> String {
 
 /// Clamp pre-epoch dates the same way as the Python pipeline.
 fn issue_date(raw: &str) -> (String, bool) {
-    let formatted = format_date(raw);
-    if formatted.len() == 10 && formatted.as_str() < "1970-01-01" {
+    let digits = raw.replace(['.', '-'], "");
+    if digits.len() == 8
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (!is_valid_compact_date(&digits) || digits.as_str() < "19700101")
+    {
         ("1970-01-01".to_string(), true)
     } else {
-        (formatted, false)
+        (format_date(raw), false)
     }
 }
 
@@ -1013,6 +1016,8 @@ mod tests {
         assert_eq!(compact_date_or_epoch("20240229"), "20240229");
         assert_eq!(compact_date_or_epoch("20240231"), "19700101");
         assert_eq!(compact_date_or_epoch("20241301"), "19700101");
+        assert_eq!(format_date("20240231"), "20240231");
+        assert_eq!(issue_date("20240231"), ("1970-01-01".to_string(), true));
         assert_eq!(compact_date_or_epoch("19691231"), "19700101");
         assert_eq!(
             commit_timestamp("20240231").unwrap(),

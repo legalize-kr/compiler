@@ -642,16 +642,26 @@ fn claim_path(registry: &mut PathRegistry, path: &str, identity: &str) -> bool {
 /// Convert compact dates to ISO dates.
 fn format_date(raw: &str) -> String {
     let digits = raw.replace(['.', '-'], "");
-    if digits.len() == 8 && digits.chars().all(|c| c.is_ascii_digit()) {
+    if is_valid_compact_date(&digits) {
         format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..8])
     } else {
         raw.to_string()
     }
 }
 
+fn promulgation_date(raw: &str) -> (String, bool) {
+    if is_epoch_clamped(raw) {
+        ("1970-01-01".to_string(), true)
+    } else {
+        (format_date(raw), false)
+    }
+}
+
 fn is_epoch_clamped(raw: &str) -> bool {
-    let date = format_date(raw);
-    date.len() == 10 && date.as_str() < "1970-01-01"
+    let digits = raw.replace(['.', '-'], "");
+    digits.len() == 8
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (!is_valid_compact_date(&digits) || digits.as_str() < "19700101")
 }
 
 /// Render article Markdown compatible with the Python converter for flat
@@ -732,7 +742,7 @@ fn render_markdown(ordinance: &Ordinance) -> String {
         }
     }
     let body = if body_text.trim().is_empty() {
-        "본문은 첨부파일(HWP)로 제공됩니다.".to_string()
+        "본문은 첨부파일 또는 원문을 참조하세요.".to_string()
     } else {
         body_text.trim().to_string()
     };
@@ -742,6 +752,8 @@ fn render_markdown(ordinance: &Ordinance) -> String {
         "api-text"
     };
     let attachments_yaml = render_attachments_yaml(&ordinance.attachments);
+    let (promulgation_date, promulgation_date_clamped) =
+        promulgation_date(&ordinance.prom_date_raw);
     format!(
         "---\n자치법규ID: {}\n자치법규일련번호: {}\n자치법규명: {}\n자치법규종류: {}\n지자체기관명: {}\n지자체구분:\n  광역: {}\n  기초: {}\n공포일자: {}\n공포번호: {}\n시행일자: {}\n제개정구분: {}\n자치법규분야: {}\n담당부서: {}\n본문출처: {}\n출처: {}\n{}공포일자보정: {}\n공포일자원문: {}\n---\n\n# {}\n\n{}\n",
         yaml_string(&ordinance.id),
@@ -751,7 +763,7 @@ fn render_markdown(ordinance: &Ordinance) -> String {
         yaml_string(&ordinance.jurisdiction),
         yaml_string(&gwangyeok),
         yaml_string(&gicho),
-        format_date(&ordinance.prom_date_raw),
+        promulgation_date,
         yaml_string(&ordinance.prom_no),
         yaml_string(&format_date(&ordinance.effective_date_raw)),
         yaml_string(&ordinance.amendment),
@@ -760,7 +772,7 @@ fn render_markdown(ordinance: &Ordinance) -> String {
         yaml_string(body_source),
         yaml_string(&public_source_url(ordinance)),
         attachments_yaml,
-        is_epoch_clamped(&ordinance.prom_date_raw),
+        promulgation_date_clamped,
         yaml_string(&ordinance.prom_date_raw),
         ordinance.name,
         body
@@ -848,10 +860,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_neutral_stub_when_body_is_missing() {
+        let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>첨부 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><별표><별표단위><별표첨부파일구분>pdf</별표첨부파일구분><별표첨부파일명>https://example.test/file.pdf</별표첨부파일명></별표단위></별표></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
+        let markdown = render_markdown(&ordinance);
+        assert!(markdown.contains("본문은 첨부파일 또는 원문을 참조하세요."));
+        assert!(!markdown.contains("첨부파일(HWP)"));
+    }
+
+    #[test]
     fn invalid_compact_dates_fall_back_to_epoch_for_commit_timestamp() {
         assert_eq!(compact_date_or_epoch("20240229"), "20240229");
         assert_eq!(compact_date_or_epoch("20240231"), "19700101");
         assert_eq!(compact_date_or_epoch("20241301"), "19700101");
+        assert_eq!(format_date("20240231"), "20240231");
+        assert_eq!(
+            promulgation_date("20240231"),
+            ("1970-01-01".to_string(), true)
+        );
         assert_eq!(compact_date_or_epoch("19691231"), "19700101");
         assert_eq!(
             commit_timestamp("20240231").unwrap(),
