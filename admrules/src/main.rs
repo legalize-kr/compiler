@@ -577,7 +577,7 @@ fn should_use_current_department_root_for_stale_ministry(
             "과학기술정보통신부",
             "방송미디어통신위원회",
             "과학기술정보통신부"
-        )
+        ) | ("기후에너지환경부", "국토교통부", "기후에너지환경부")
     )
 }
 
@@ -1274,6 +1274,17 @@ mod tests {
         assert_eq!(
             admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("과학기술정보통신부/_본부/공고/이동통신 주파수 할당/본문.md")
+        );
+    }
+
+    #[test]
+    fn uses_current_environment_ministry_for_river_rules() {
+        let xml = "<AdmRulService><행정규칙일련번호>2100000079411</행정규칙일련번호><행정규칙명>하천에 관한 사무처리규정</행정규칙명><행정규칙종류>훈령</행정규칙종류><소관부처명>국토교통부</소관부처명><상위부처명>기후에너지환경부</상위부처명><담당부서기관명>기후에너지환경부(하천계획과)</담당부서기관명><발령일자>20170307</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>";
+        let rule = parse_admrule(xml.as_bytes(), "2100000079411").unwrap();
+        assert_eq!(rule.org_path, ["기후에너지환경부"]);
+        assert_eq!(
+            admrule_path(&rule, &mut PathRegistry::new()),
+            PathBuf::from("기후에너지환경부/_본부/훈령/하천에 관한 사무처리규정/본문.md")
         );
     }
 
