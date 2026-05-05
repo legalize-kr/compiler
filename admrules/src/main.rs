@@ -537,7 +537,9 @@ fn resolve_ministry_names(ministry: &str, parent: &str, department_org: &str) ->
         normalized_parent.clone()
     };
 
-    if should_use_current_department_root_for_stale_ministry(&top, &agency, &department_agency) {
+    if should_use_current_department_root_for_stale_ministry(&top, &agency, &department_agency)
+        || should_collapse_historical_root_ministry(&top, &agency)
+    {
         agency.clone_from(&top);
     } else if let Some((chain_top, chain_agency)) =
         split_parent_agency_chain(&normalized_parent, &department_agency)
@@ -577,6 +579,26 @@ fn should_use_current_department_root_for_stale_ministry(
             "과학기술정보통신부"
         )
     )
+}
+
+fn should_collapse_historical_root_ministry(top: &str, agency: &str) -> bool {
+    match agency {
+        "문교부" | "교육인적자원부" => top == "교육부",
+        "교육과학기술부" => matches!(top, "교육부" | "과학기술정보통신부"),
+        "노동부" => top == "고용노동부",
+        "외교통상부" => top == "외교부",
+        "국토해양부" => matches!(top, "국토교통부" | "해양수산부" | "기후에너지환경부"),
+        "지식경제부" => top == "산업통상부",
+        "정보통신부" => top == "과학기술정보통신부",
+        "문화관광부" => top == "문화체육관광부",
+        "안전행정부" => top == "행정안전부",
+        "보건복지가족부" => top == "보건복지부",
+        "농림부" => top == "농림축산식품부",
+        "농림수산부" | "농림수산식품부" => {
+            matches!(top, "농림축산식품부" | "해양수산부")
+        }
+        _ => false,
+    }
 }
 
 fn should_use_department_root(top: &str, department_agency: &str) -> bool {
@@ -1097,6 +1119,45 @@ mod tests {
             admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("해양수산부/_본부/고시/무인도서 관리유형 재지정(변경) 고시/본문.md")
         );
+    }
+
+    #[test]
+    fn collapses_historical_root_ministry_under_current_top() {
+        let cases = [
+            ("교육부", "문교부"),
+            ("교육부", "교육인적자원부"),
+            ("교육부", "교육과학기술부"),
+            ("과학기술정보통신부", "교육과학기술부"),
+            ("고용노동부", "노동부"),
+            ("외교부", "외교통상부"),
+            ("해양수산부", "국토해양부"),
+            ("기후에너지환경부", "국토해양부"),
+            ("산업통상부", "지식경제부"),
+            ("과학기술정보통신부", "정보통신부"),
+            ("문화체육관광부", "문화관광부"),
+            ("행정안전부", "안전행정부"),
+            ("보건복지부", "보건복지가족부"),
+            ("농림축산식품부", "농림부"),
+            ("농림축산식품부", "농림수산부"),
+            ("농림축산식품부", "농림수산식품부"),
+            ("해양수산부", "농림수산식품부"),
+        ];
+        for (current, historical) in cases {
+            let xml = format!(
+                "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>{historical} 테스트 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>{historical}</소관부처명><상위부처명>{current}</상위부처명><담당부서기관명>{current}(운영지원과)</담당부서기관명><발령일자>20240504</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>"
+            );
+            let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
+            assert_eq!(rule.top_ministry, current);
+            assert_eq!(rule.ministry, current);
+            assert_eq!(rule.org_path, [current]);
+            assert_eq!(rule.original_ministry, historical);
+            assert_eq!(
+                admrule_path(&rule, &mut PathRegistry::new()),
+                PathBuf::from(format!(
+                    "{current}/_본부/고시/{historical} 테스트 고시/본문.md"
+                ))
+            );
+        }
     }
 
     #[test]
