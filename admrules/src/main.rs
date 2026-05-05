@@ -188,7 +188,7 @@ fn admrule_commit_message(rule: &Admrule) -> String {
 
 fn compact_date_or_epoch(raw: &str) -> String {
     let digits = raw.replace(['.', '-'], "");
-    if digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    if is_valid_compact_date(&digits) {
         if digits.as_str() < "19700101" {
             "19700101".to_string()
         } else {
@@ -197,6 +197,25 @@ fn compact_date_or_epoch(raw: &str) -> String {
     } else {
         "19700101".to_string()
     }
+}
+
+fn is_valid_compact_date(date: &str) -> bool {
+    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(year) = date[0..4].parse::<i32>() else {
+        return false;
+    };
+    let Ok(month_num) = date[4..6].parse::<u8>() else {
+        return false;
+    };
+    let Ok(month) = Month::try_from(month_num) else {
+        return false;
+    };
+    let Ok(day) = date[6..8].parse::<u8>() else {
+        return false;
+    };
+    Date::from_calendar_date(year, month, day).is_ok()
 }
 
 fn commit_timestamp(raw: &str) -> Result<i64> {
@@ -987,6 +1006,18 @@ mod tests {
         assert!(markdown.contains("첨부파일:\n- 별표번호: '0001'"));
         assert!(markdown.contains("파일링크: 'https://www.law.go.kr/LSW/flDownload.do?flSeq=1'"));
         assert!(markdown.contains("PDF링크: 'https://www.law.go.kr/LSW/flDownload.do?flSeq=2'"));
+    }
+
+    #[test]
+    fn invalid_compact_dates_fall_back_to_epoch_for_commit_timestamp() {
+        assert_eq!(compact_date_or_epoch("20240229"), "20240229");
+        assert_eq!(compact_date_or_epoch("20240231"), "19700101");
+        assert_eq!(compact_date_or_epoch("20241301"), "19700101");
+        assert_eq!(compact_date_or_epoch("19691231"), "19700101");
+        assert_eq!(
+            commit_timestamp("20240231").unwrap(),
+            commit_timestamp("19700101").unwrap()
+        );
     }
 
     #[test]

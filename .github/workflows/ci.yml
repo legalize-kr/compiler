@@ -16,7 +16,7 @@ jobs:
         with:
           repository: legalize-kr/legalize-pipeline
           path: legalize-pipeline
-          ref: 59d4ea8f0a3c7c3c953875113f6bebc42954edc6
+          ref: d27a0372931f9681fb5e84387477a72aa994d874
           persist-credentials: false
       - run: python3 -m pip install -r legalize-pipeline/requirements.txt
       - run: >

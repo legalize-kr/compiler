@@ -106,8 +106,6 @@ fn pipeline_dir() -> Option<PathBuf> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .parent()
-        .unwrap()
         .to_path_buf();
     let mut candidates = vec![repo_root.join("legalize-pipeline")];
     if let Some(parent) = repo_root.parent() {
