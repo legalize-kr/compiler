@@ -65,13 +65,24 @@ struct CommitPeople<'a> {
 }
 
 /// Borrowed blob payload that was already hashed and compressed.
-struct PrecomputedBlob<'a> {
+pub struct PreparedBlob<'a> {
     /// Original blob size.
     size: usize,
     /// Canonical Git object id for the blob body.
     sha: [u8; 20],
     /// Deflated PACK payload for the blob body.
     compressed: &'a [u8],
+}
+
+impl<'a> PreparedBlob<'a> {
+    /// Wraps a precomputed blob id and pack payload for one file body.
+    pub fn from_parts(content: &[u8], sha: [u8; 20], compressed: &'a [u8]) -> Self {
+        Self {
+            size: content.len(),
+            sha,
+            compressed,
+        }
+    }
 }
 
 /// Commit timestamp rendered in Korea Standard Time (`+0900`).
@@ -224,6 +235,43 @@ impl TreeNode {
                 TreeEntry::Tree(child) => child.insert_file(tail, sha),
             }
         }
+    }
+
+    /// Removes one file entry, pruning empty ancestor trees.
+    fn remove_file(&mut self, components: &[&str]) -> Result<bool> {
+        let Some((head, tail)) = components.split_first() else {
+            bail!("empty repository path");
+        };
+
+        if tail.is_empty() {
+            return match self.entries.get(*head) {
+                Some(TreeEntry::File { .. }) => {
+                    self.entries.remove(*head);
+                    self.cached_sha = None;
+                    Ok(true)
+                }
+                Some(TreeEntry::Tree(_)) => bail!("path conflicts with existing tree: {head}"),
+                None => Ok(false),
+            };
+        }
+
+        let mut prune_child = false;
+        let removed = match self.entries.get_mut(*head) {
+            Some(TreeEntry::File { .. }) => bail!("path conflicts with existing file: {head}"),
+            Some(TreeEntry::Tree(child)) => {
+                let removed = child.remove_file(tail)?;
+                prune_child = removed && child.entries.is_empty();
+                removed
+            }
+            None => false,
+        };
+        if removed {
+            if prune_child {
+                self.entries.remove(*head);
+            }
+            self.cached_sha = None;
+        }
+        Ok(removed)
     }
 
     /// Materializes this tree and every dirty child tree.
@@ -400,11 +448,33 @@ impl BareRepoWriter {
         };
         self.commit_file(
             path,
-            PrecomputedBlob {
-                size: markdown.len(),
-                sha: blob_sha,
-                compressed: compressed_blob,
+            PreparedBlob::from_parts(markdown, blob_sha, compressed_blob),
+            message,
+            CommitPeople {
+                author: bot,
+                committer: bot,
             },
+            time,
+        )
+    }
+
+    /// Commits one rendered file while removing stale paths in the same commit.
+    pub fn commit_bot_file_with_deletions(
+        &mut self,
+        path: &RepoPathBuf,
+        blob: PreparedBlob<'_>,
+        stale_paths: &[RepoPathBuf],
+        message: &str,
+        time: GitTimestampKst,
+    ) -> Result<()> {
+        let bot = GitPerson {
+            name: "legalize-kr-bot",
+            email: "bot@legalize.kr",
+        };
+        self.commit_file_with_deletions(
+            path,
+            blob,
+            stale_paths,
             message,
             CommitPeople {
                 author: bot,
@@ -455,11 +525,7 @@ impl BareRepoWriter {
         let (blob_sha, compressed_blob) = precompute_blob(content);
         self.commit_file(
             path,
-            PrecomputedBlob {
-                size: content.len(),
-                sha: blob_sha,
-                compressed: &compressed_blob,
-            },
+            PreparedBlob::from_parts(content, blob_sha, &compressed_blob),
             message,
             CommitPeople {
                 author,
@@ -501,13 +567,46 @@ impl BareRepoWriter {
     fn commit_file(
         &mut self,
         path: &RepoPathBuf,
-        blob: PrecomputedBlob<'_>,
+        blob: PreparedBlob<'_>,
         message: &str,
         people: CommitPeople<'_>,
         time: GitTimestampKst,
     ) -> Result<()> {
         let components = validate_path(path.as_str())?;
         self.root.ensure_can_insert_file(&components)?;
+        self.writer.write_precompressed_object(
+            PackObjectKind::Blob,
+            blob.size,
+            blob.sha,
+            blob.compressed,
+        )?;
+        self.root.insert_file(&components, blob.sha)?;
+        let root_sha = self.root.materialize(&mut self.writer)?;
+        let commit_sha =
+            self.write_commit(root_sha, message, people.author, people.committer, time)?;
+        self.parent_commit = Some(commit_sha);
+        Ok(())
+    }
+
+    /// Commits one file change after deleting stale paths from the same tree.
+    fn commit_file_with_deletions(
+        &mut self,
+        path: &RepoPathBuf,
+        blob: PreparedBlob<'_>,
+        stale_paths: &[RepoPathBuf],
+        message: &str,
+        people: CommitPeople<'_>,
+        time: GitTimestampKst,
+    ) -> Result<()> {
+        let components = validate_path(path.as_str())?;
+        let stale_components = stale_paths
+            .iter()
+            .map(|path| validate_path(path.as_str()))
+            .collect::<Result<Vec<_>>>()?;
+        self.root.ensure_can_insert_file(&components)?;
+        for components in &stale_components {
+            self.root.remove_file(components)?;
+        }
         self.writer.write_precompressed_object(
             PackObjectKind::Blob,
             blob.size,
@@ -1245,6 +1344,52 @@ mod tests {
             "2"
         );
         assert_eq!(git_stdout(&output, ["show", "HEAD:same/path.md"]), "two\n");
+    }
+
+    #[test]
+    fn deletes_stale_path_in_same_commit() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("output.git");
+        let mut writer = BareRepoWriter::create(&output).unwrap();
+
+        let old = b"old\n";
+        let (sha, compressed) = precompute_blob(old);
+        writer
+            .commit_bot_file(
+                &RepoPathBuf::file("old/path.md"),
+                old,
+                sha,
+                &compressed,
+                "old",
+                GitTimestampKst::from_epoch(1),
+            )
+            .unwrap();
+
+        let new = b"new\n";
+        let (sha, compressed) = precompute_blob(new);
+        writer
+            .commit_bot_file_with_deletions(
+                &RepoPathBuf::file("new/path.md"),
+                PreparedBlob::from_parts(new, sha, &compressed),
+                &[RepoPathBuf::file("old/path.md")],
+                "rename",
+                GitTimestampKst::from_epoch(2),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        git_ok(&output, ["fsck", "--full"]);
+        assert_eq!(
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "2"
+        );
+        assert_eq!(git_stdout(&output, ["show", "HEAD:new/path.md"]), "new\n");
+        assert!(
+            git_stdout(&output, ["ls-tree", "-r", "--name-only", "HEAD"]).contains("new/path.md")
+        );
+        assert!(
+            !git_stdout(&output, ["ls-tree", "-r", "--name-only", "HEAD"]).contains("old/path.md")
+        );
     }
 
     #[test]

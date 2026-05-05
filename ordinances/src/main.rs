@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
+use git_writer::{BareRepoWriter, GitTimestampKst, PreparedBlob, RepoPathBuf, precompute_blob};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
@@ -117,14 +117,24 @@ fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> R
     )?;
     for entry in &entries {
         let (blob_sha, compressed_blob) = precompute_blob(&entry.content);
-        repo.commit_bot_file(
-            &RepoPathBuf::file(&entry.path),
-            &entry.content,
-            blob_sha,
-            &compressed_blob,
-            &entry.message,
-            GitTimestampKst::from_epoch(entry.timestamp),
-        )?;
+        if let Some(previous_path) = &entry.previous_path {
+            repo.commit_bot_file_with_deletions(
+                &RepoPathBuf::file(&entry.path),
+                PreparedBlob::from_parts(&entry.content, blob_sha, &compressed_blob),
+                &[RepoPathBuf::file(previous_path)],
+                &entry.message,
+                GitTimestampKst::from_epoch(entry.timestamp),
+            )?;
+        } else {
+            repo.commit_bot_file(
+                &RepoPathBuf::file(&entry.path),
+                &entry.content,
+                blob_sha,
+                &compressed_blob,
+                &entry.message,
+                GitTimestampKst::from_epoch(entry.timestamp),
+            )?;
+        }
     }
     repo.finish()?;
     eprintln!("committed {} ordinance markdown files", entries.len());
@@ -134,6 +144,8 @@ fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> R
 #[derive(Debug)]
 struct ImportEntry {
     path: String,
+    previous_path: Option<String>,
+    identity: String,
     content: Vec<u8>,
     message: String,
     timestamp: i64,
@@ -177,6 +189,8 @@ fn render_ordinance_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Ve
         let rel = ordinance_path(&ordinance, &mut registry);
         entries.push(ImportEntry {
             path: rel.to_string_lossy().replace('\\', "/"),
+            previous_path: None,
+            identity: ordinance.id.clone(),
             content: render_markdown(&ordinance).into_bytes(),
             message: ordinance_commit_message(&ordinance),
             timestamp: commit_timestamp(&ordinance.prom_date_raw)?,
@@ -190,11 +204,23 @@ fn render_ordinance_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Ve
             .then_with(|| a.sort_id.cmp(&b.sort_id))
             .then_with(|| a.path.cmp(&b.path))
     });
+    assign_previous_paths(&mut entries);
     eprintln!(
         "prepared {} ordinance markdown files; skipped {skipped}",
         entries.len()
     );
     Ok(entries)
+}
+
+fn assign_previous_paths(entries: &mut [ImportEntry]) {
+    let mut latest_paths = BTreeMap::new();
+    for entry in entries {
+        if let Some(previous_path) = latest_paths.insert(entry.identity.clone(), entry.path.clone())
+            && previous_path != entry.path
+        {
+            entry.previous_path = Some(previous_path);
+        }
+    }
 }
 
 fn ordinance_commit_message(ordinance: &Ordinance) -> String {
@@ -258,6 +284,13 @@ fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<
     fs::write(output.join("README.md"), REPOSITORY_README)?;
     let entries = render_ordinance_entries(cache_dir, limit)?;
     for entry in &entries {
+        if let Some(previous_path) = &entry.previous_path {
+            let previous = output.join(previous_path);
+            if previous.exists() {
+                fs::remove_file(&previous)
+                    .with_context(|| format!("failed to remove {}", previous.display()))?;
+            }
+        }
         let target = output.join(&entry.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -544,6 +577,9 @@ fn split_jurisdiction(raw: &str) -> Result<(String, String)> {
     ];
     let text = nfc(raw)
         .replace("제주도교육청", "제주특별자치도교육청")
+        .replace("강원도", "강원특별자치도")
+        .replace("전라북도", "전북특별자치도")
+        .replace("제주도", "제주특별자치도")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -808,6 +844,22 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_historical_jurisdiction_names() {
+        assert_eq!(
+            split_jurisdiction("강원도 춘천시").unwrap(),
+            ("강원특별자치도".to_string(), "춘천시".to_string())
+        );
+        assert_eq!(
+            split_jurisdiction("전라북도 전주시").unwrap(),
+            ("전북특별자치도".to_string(), "전주시".to_string())
+        );
+        assert_eq!(
+            split_jurisdiction("제주도 제주시").unwrap(),
+            ("제주특별자치도".to_string(), "제주시".to_string())
+        );
+    }
+
+    #[test]
     fn renders_addenda_when_articles_are_empty() {
         let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>부칙 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><부칙><부칙내용>이 조례는 공포한 날부터 시행한다.</부칙내용></부칙></Ordin>";
         let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
@@ -908,6 +960,63 @@ mod tests {
         assert!(
             checkout
                 .join("서울특별시/_본청/조례/서울특별시 테스트 조례/본문.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn bare_repo_removes_stale_path_when_ordinance_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("100.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>1</자치법규일련번호><자치법규명>이전 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240101</공포일자><공포번호>1</공포번호><조문내용>이전 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        fs::write(
+            cache.join("200.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>2</자치법규일련번호><자치법규명>새 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240201</공포일자><공포번호>2</공포번호><조문내용>새 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        let repo = temp.path().join("out.git");
+
+        compile_bare_repo(&cache, &repo, None).unwrap();
+
+        git_ok(&repo, ["fsck", "--full"]);
+        assert_eq!(git_stdout(&repo, ["rev-list", "--count", "--all"]), "3");
+        let files = git_stdout(&repo, ["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(files.contains("서울특별시/_본청/조례/새 조례/본문.md"));
+        assert!(!files.contains("서울특별시/_본청/조례/이전 조례/본문.md"));
+    }
+
+    #[test]
+    fn compile_dir_removes_stale_path_when_ordinance_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("100.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>1</자치법규일련번호><자치법규명>이전 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240101</공포일자><공포번호>1</공포번호><조문내용>이전 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        fs::write(
+            cache.join("200.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>2</자치법규일련번호><자치법규명>새 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240201</공포일자><공포번호>2</공포번호><조문내용>새 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        let output = temp.path().join("out");
+
+        compile_dir(&cache, &output, None).unwrap();
+
+        assert!(
+            output
+                .join("서울특별시/_본청/조례/새 조례/본문.md")
+                .exists()
+        );
+        assert!(
+            !output
+                .join("서울특별시/_본청/조례/이전 조례/본문.md")
                 .exists()
         );
     }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use git_writer::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
+use git_writer::{BareRepoWriter, GitTimestampKst, PreparedBlob, RepoPathBuf, precompute_blob};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
@@ -113,14 +113,24 @@ fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> R
     )?;
     for entry in &entries {
         let (blob_sha, compressed_blob) = precompute_blob(&entry.content);
-        repo.commit_bot_file(
-            &RepoPathBuf::file(&entry.path),
-            &entry.content,
-            blob_sha,
-            &compressed_blob,
-            &entry.message,
-            GitTimestampKst::from_epoch(entry.timestamp),
-        )?;
+        if let Some(previous_path) = &entry.previous_path {
+            repo.commit_bot_file_with_deletions(
+                &RepoPathBuf::file(&entry.path),
+                PreparedBlob::from_parts(&entry.content, blob_sha, &compressed_blob),
+                &[RepoPathBuf::file(previous_path)],
+                &entry.message,
+                GitTimestampKst::from_epoch(entry.timestamp),
+            )?;
+        } else {
+            repo.commit_bot_file(
+                &RepoPathBuf::file(&entry.path),
+                &entry.content,
+                blob_sha,
+                &compressed_blob,
+                &entry.message,
+                GitTimestampKst::from_epoch(entry.timestamp),
+            )?;
+        }
     }
     repo.finish()?;
     eprintln!("committed {} admrule markdown files", entries.len());
@@ -130,6 +140,8 @@ fn compile_bare_repo(cache_dir: &Path, output: &Path, limit: Option<usize>) -> R
 #[derive(Debug)]
 struct ImportEntry {
     path: String,
+    previous_path: Option<String>,
+    identity: String,
     content: Vec<u8>,
     message: String,
     timestamp: i64,
@@ -155,6 +167,8 @@ fn render_admrule_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<
         let rel = admrule_path(&rule, &mut registry);
         entries.push(ImportEntry {
             path: rel.to_string_lossy().replace('\\', "/"),
+            previous_path: None,
+            identity: rule.serial.clone(),
             content: render_markdown(&rule).into_bytes(),
             message: admrule_commit_message(&rule),
             timestamp: commit_timestamp(&rule.issue_date_raw)?,
@@ -168,7 +182,19 @@ fn render_admrule_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<
             .then_with(|| a.sort_id.cmp(&b.sort_id))
             .then_with(|| a.path.cmp(&b.path))
     });
+    assign_previous_paths(&mut entries);
     Ok(entries)
+}
+
+fn assign_previous_paths(entries: &mut [ImportEntry]) {
+    let mut latest_paths = BTreeMap::new();
+    for entry in entries {
+        if let Some(previous_path) = latest_paths.insert(entry.identity.clone(), entry.path.clone())
+            && previous_path != entry.path
+        {
+            entry.previous_path = Some(previous_path);
+        }
+    }
 }
 
 fn admrule_commit_message(rule: &Admrule) -> String {
@@ -234,27 +260,22 @@ fn commit_timestamp(raw: &str) -> Result<i64> {
 fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
     fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
     fs::write(output.join("README.md"), REPOSITORY_README)?;
-    let mut files = read_xml_files(cache_dir)?;
-    if let Some(limit) = limit {
-        files.truncate(limit);
-    }
-    let mut registry = PathRegistry::new();
-    let mut written = 0usize;
-    for path in files {
-        let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let rule = parse_admrule(
-            &raw,
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
-        )?;
-        let rel = admrule_path(&rule, &mut registry);
-        let target = output.join(rel);
+    let entries = render_admrule_entries(cache_dir, limit)?;
+    for entry in &entries {
+        if let Some(previous_path) = &entry.previous_path {
+            let previous = output.join(previous_path);
+            if previous.exists() {
+                fs::remove_file(&previous)
+                    .with_context(|| format!("failed to remove {}", previous.display()))?;
+            }
+        }
+        let target = output.join(&entry.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&target, render_markdown(&rule))?;
-        written += 1;
+        fs::write(&target, &entry.content)?;
     }
-    eprintln!("written {written} admrule markdown files");
+    eprintln!("written {} admrule markdown files", entries.len());
     Ok(())
 }
 
@@ -1364,6 +1385,63 @@ mod tests {
         assert!(
             checkout
                 .join("행정안전부/_본부/고시/테스트 고시/본문.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn bare_repo_removes_stale_path_when_rule_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("100.xml"),
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙ID>ABC</행정규칙ID><행정규칙명>이전 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령번호>1</발령번호><발령일자>20240101</발령일자><조문내용>이전 본문</조문내용></AdmRulService>",
+        )
+        .unwrap();
+        fs::write(
+            cache.join("200.xml"),
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙ID>ABC</행정규칙ID><행정규칙명>새 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령번호>2</발령번호><발령일자>20240201</발령일자><조문내용>새 본문</조문내용></AdmRulService>",
+        )
+        .unwrap();
+        let repo = temp.path().join("out.git");
+
+        compile_bare_repo(&cache, &repo, None).unwrap();
+
+        git_ok(&repo, ["fsck", "--full"]);
+        assert_eq!(git_stdout(&repo, ["rev-list", "--count", "--all"]), "3");
+        let files = git_stdout(&repo, ["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(files.contains("행정안전부/_본부/고시/새 고시/본문.md"));
+        assert!(!files.contains("행정안전부/_본부/고시/이전 고시/본문.md"));
+    }
+
+    #[test]
+    fn compile_dir_removes_stale_path_when_rule_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("100.xml"),
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>이전 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령일자>20240101</발령일자><조문내용>이전 본문</조문내용></AdmRulService>",
+        )
+        .unwrap();
+        fs::write(
+            cache.join("200.xml"),
+            "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>새 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령일자>20240201</발령일자><조문내용>새 본문</조문내용></AdmRulService>",
+        )
+        .unwrap();
+        let output = temp.path().join("out");
+
+        compile_dir(&cache, &output, None).unwrap();
+
+        assert!(
+            output
+                .join("행정안전부/_본부/고시/새 고시/본문.md")
+                .exists()
+        );
+        assert!(
+            !output
+                .join("행정안전부/_본부/고시/이전 고시/본문.md")
                 .exists()
         );
     }
