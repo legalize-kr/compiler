@@ -35,7 +35,7 @@ use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_o
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
 
 /// Global allocator tuned for high-throughput allocation-heavy pack generation.
-#[cfg(feature = "default")]
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

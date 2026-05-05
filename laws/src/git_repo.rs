@@ -1255,7 +1255,7 @@ thread_local! {
     static COMP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 
     /// Reuses one fast zlib compressor per thread for whole-buffer pack payload compression.
-    #[cfg(feature = "default")]
+    #[cfg(feature = "libdeflater")]
     static COMPRESSOR: RefCell<libdeflater::Compressor> =
         RefCell::new(libdeflater::Compressor::new(libdeflater::CompressionLvl::new(1).unwrap()));
 }
@@ -1263,7 +1263,7 @@ thread_local! {
 /// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
     COMP_BUF.with(|buf_cell| {
-        #[cfg(feature = "default")]
+        #[cfg(feature = "libdeflater")]
         return COMPRESSOR.with(|comp_cell| {
             let mut comp = comp_cell.borrow_mut();
             let mut buf = buf_cell.borrow_mut();
@@ -1275,7 +1275,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
             buf[..actual].to_vec()
         });
 
-        #[cfg(not(feature = "default"))]
+        #[cfg(not(feature = "libdeflater"))]
         {
             use zlib_rs::{DeflateConfig, ReturnCode, compress_bound, compress_slice};
 

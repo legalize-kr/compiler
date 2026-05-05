@@ -27,7 +27,9 @@ libdeflater = { workspace = true, optional = true }
 # Enabling these optional dependencies improves performance by using mimalloc
 # instead of the default allocator and libdeflater instead of zlib-rs, but it
 # makes cross-compilation harder. Both are enabled by default.
-default = ["dep:mimalloc", "dep:libdeflater"]
+default = ["mimalloc", "libdeflater"]
+mimalloc = ["dep:mimalloc"]
+libdeflater = ["dep:libdeflater"]
 
 [dev-dependencies]
 tempfile.workspace = true
