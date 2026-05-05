@@ -870,7 +870,7 @@ fn render_markdown(rule: &Admrule) -> String {
     };
     let attachments_yaml = render_attachments_yaml(&rule.attachments);
     format!(
-        "---\n행정규칙ID: {}\n행정규칙일련번호: {}\n행정규칙명: {}\n행정규칙종류: {}\n상위기관명: {}\n소관부처명: {}\n{}{}기관코드: {}\n발령번호: {}\n발령일자: {}\n시행일자: {}\n제개정구분: {}\n제개정구분코드: {}\n현행연혁구분: {}\nbody_source: {}\nhwp_sha256: null\nattachments_hwp: false\n출처: {}\nsource_url: ''\n{}epoch_clamped: {}\n발령일자_raw: {}\n---\n\n{}\n",
+        "---\n행정규칙ID: {}\n행정규칙일련번호: {}\n행정규칙명: {}\n행정규칙종류: {}\n상위기관명: {}\n소관부처명: {}\n{}{}기관코드: {}\n발령번호: {}\n발령일자: {}\n시행일자: {}\n제개정구분: {}\n제개정구분코드: {}\n현행연혁구분: {}\n본문출처: {}\n출처: {}\n{}발령일자보정: {}\n발령일자원문: {}\n---\n\n{}\n",
         yaml_string(&rule.rule_id),
         yaml_string(&rule.serial),
         yaml_string(&rule.name),

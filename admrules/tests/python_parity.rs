@@ -52,6 +52,18 @@ fn fixture_matches_python_pipeline_converter() {
     let actual_markdown = fs::read_to_string(&actual_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", actual_path.display()));
 
+    assert!(actual_markdown.contains("본문출처: 'api-text'"));
+    for legacy_key in [
+        "source_url:",
+        "body_source:",
+        "hwp_sha256:",
+        "attachments_hwp:",
+        "epoch_clamped:",
+        "발령일자_raw:",
+    ] {
+        assert!(!actual_markdown.contains(legacy_key));
+    }
+
     assert_eq!(actual_markdown, expected_markdown);
 }
 
