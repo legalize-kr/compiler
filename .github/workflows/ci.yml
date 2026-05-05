@@ -16,7 +16,10 @@ jobs:
         with:
           repository: legalize-kr/legalize-pipeline
           path: legalize-pipeline
-          ref: main
+          # Pinned to a reviewed legalize-pipeline commit so this build is
+          # reproducible: bumping requires re-running parity tests against the
+          # new SHA in a follow-up PR. Do not move this back to a moving ref.
+          ref: bda9ecff7c1d4bcbd7f076623dbe270493c64c07
           persist-credentials: false
       - run: python3 -m pip install -r legalize-pipeline/requirements.txt
       - run: >
@@ -27,6 +30,10 @@ jobs:
       - run: cargo test --workspace
         env:
           ORACLE_PATH: target/precedent-oracle.jsonl
+          # Anchors the python_parity tests to the checkout above so they
+          # fail loudly (not silently skip) if the pipeline checkout is ever
+          # missing or relocated. Local dev still falls back to autodiscovery.
+          LEGALIZE_PIPELINE_ROOT: ${{ github.workspace }}/legalize-pipeline
           PYTHON: python3
       - run: cargo clippy --workspace --no-deps -- -D warnings
       - run: cargo shear
