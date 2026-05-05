@@ -372,6 +372,7 @@ fn canonical_ministry_name(value: &str) -> Option<&'static str> {
         "중소기업청" => Some("중소벤처기업부"),
         "국가보훈처" => Some("국가보훈부"),
         "방송통신위원회" => Some("방송미디어통신위원회"),
+        "방송통신사무소" => Some("방송미디어통신사무소"),
         "여성가족부" => Some("성평등가족부"),
         "식품의약품안전청" => Some("식품의약품안전처"),
         "평생교육진흥원" => Some("국가평생교육진흥원"),
@@ -389,7 +390,9 @@ fn resolve_ministry_names(ministry: &str, parent: &str, department_org: &str) ->
         normalized_parent.clone()
     };
 
-    if let Some((chain_top, chain_agency)) =
+    if should_use_current_department_root_for_stale_ministry(&top, &agency, &department_agency) {
+        agency.clone_from(&top);
+    } else if let Some((chain_top, chain_agency)) =
         split_parent_agency_chain(&normalized_parent, &department_agency)
     {
         top = chain_top;
@@ -412,6 +415,21 @@ fn resolve_ministry_names(ministry: &str, parent: &str, department_org: &str) ->
         agency.clone_from(&top);
     }
     (top, agency)
+}
+
+fn should_use_current_department_root_for_stale_ministry(
+    top: &str,
+    agency: &str,
+    department_agency: &str,
+) -> bool {
+    matches!(
+        (top, agency, department_agency),
+        (
+            "과학기술정보통신부",
+            "방송미디어통신위원회",
+            "과학기술정보통신부"
+        )
+    )
 }
 
 fn should_use_department_root(top: &str, department_agency: &str) -> bool {
@@ -486,6 +504,10 @@ fn legal_parent_agency(value: &str) -> Option<&'static str> {
         "기상청" => Some("기후에너지환경부"),
         "해양경찰청" => Some("해양수산부"),
         "방송미디어통신위원회" | "국가교육위원회" => Some("대통령"),
+        "방송미디어통신사무소" => Some("방송미디어통신위원회"),
+        "국립전파연구원" | "중앙전파관리소" => Some("과학기술정보통신부"),
+        "전파시험인증센터" => Some("국립전파연구원"),
+        "위성전파감시센터" | "전파관리소" => Some("중앙전파관리소"),
         "우주항공청" => Some("과학기술정보통신부"),
         "행정중심복합도시건설청" | "새만금개발청" => Some("국토교통부"),
         "대검찰청" => Some("법무부"),
@@ -865,6 +887,18 @@ mod tests {
             resolve_org_path("민주평화통일자문회의사무처", "민주평화통일자문회의사무처"),
             ["대통령", "민주평화통일자문회의사무처"]
         );
+        assert_eq!(
+            resolve_org_path("국립전파연구원", "국립전파연구원"),
+            ["과학기술정보통신부", "국립전파연구원"]
+        );
+        assert_eq!(
+            resolve_org_path("중앙전파관리소", "중앙전파관리소"),
+            ["과학기술정보통신부", "중앙전파관리소"]
+        );
+        assert_eq!(
+            resolve_org_path("전파관리소", "전파관리소"),
+            ["과학기술정보통신부", "중앙전파관리소", "전파관리소"]
+        );
     }
 
     #[test]
@@ -883,6 +917,19 @@ mod tests {
         assert_eq!(
             admrule_path(&education_rule, &mut BTreeSet::new()),
             PathBuf::from("대통령/국가교육위원회/고시/국가교육위원회 규칙/본문.md")
+        );
+
+        let office_xml = "<AdmRulService><행정규칙일련번호>125</행정규칙일련번호><행정규칙명>방송미디어통신사무소 세칙</행정규칙명><행정규칙종류>훈령</행정규칙종류><소관부처명>방송통신사무소</소관부처명><상위부처명>방송통신위원회</상위부처명><담당부서기관명>방송미디어통신사무소</담당부서기관명><발령일자>20260202</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>";
+        let office_rule = parse_admrule(office_xml.as_bytes(), "125").unwrap();
+        assert_eq!(
+            office_rule.org_path,
+            ["대통령", "방송미디어통신위원회", "방송미디어통신사무소"]
+        );
+        assert_eq!(
+            admrule_path(&office_rule, &mut BTreeSet::new()),
+            PathBuf::from(
+                "대통령/방송미디어통신위원회/방송미디어통신사무소/훈령/방송미디어통신사무소 세칙/본문.md"
+            )
         );
     }
 
@@ -905,6 +952,17 @@ mod tests {
         assert_eq!(
             admrule_path(&rule, &mut BTreeSet::new()),
             PathBuf::from("기후에너지환경부/_본부/고시/전력산업 고시/본문.md")
+        );
+    }
+
+    #[test]
+    fn keeps_stale_broadcast_commission_rule_under_current_science_ministry() {
+        let xml = "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>이동통신 주파수 할당</행정규칙명><행정규칙종류>공고</행정규칙종류><소관부처명>방송통신위원회</소관부처명><상위부처명>과학기술정보통신부</상위부처명><담당부서기관명>과학기술정보통신부(주파수정책과)</담당부서기관명><발령일자>20110629</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>";
+        let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
+        assert_eq!(rule.org_path, ["과학기술정보통신부"]);
+        assert_eq!(
+            admrule_path(&rule, &mut BTreeSet::new()),
+            PathBuf::from("과학기술정보통신부/_본부/공고/이동통신 주파수 할당/본문.md")
         );
     }
 
