@@ -62,6 +62,8 @@ struct Ordinance {
     articles: Vec<Article>,
     /// Addenda text blocks.
     addenda: Vec<String>,
+    /// Attachment links parsed from 별표 blocks.
+    attachments: Vec<Attachment>,
 }
 
 /// Parsed ordinance article unit.
@@ -70,6 +72,17 @@ struct Article {
     no: String,
     title: String,
     content: String,
+}
+
+/// Parsed ordinance 별표 attachment link.
+#[derive(Debug, Clone)]
+struct Attachment {
+    bylaw_no: String,
+    branch_no: String,
+    kind: String,
+    title: String,
+    file_type: String,
+    file_link: String,
 }
 
 /// 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC.
@@ -265,6 +278,7 @@ fn parse_ordinance(raw: &[u8], fallback_id: &str) -> Result<Ordinance> {
     let id = first(&fields, &["자치법규ID"])
         .unwrap_or(fallback_id)
         .to_string();
+    let attachments = collect_attachments(raw)?;
     Ok(Ordinance {
         id,
         serial: first(&fields, &["자치법규일련번호"])
@@ -285,6 +299,7 @@ fn parse_ordinance(raw: &[u8], fallback_id: &str) -> Result<Ordinance> {
             .get("부칙내용")
             .map(|values| values.iter().map(|value| nfc(value)).collect())
             .unwrap_or_default(),
+        attachments,
     })
 }
 
@@ -362,6 +377,84 @@ fn collect_articles(fields: &BTreeMap<String, Vec<String>>) -> Vec<Article> {
             content: nfc(content),
         })
         .collect()
+}
+
+fn collect_attachments(raw: &[u8]) -> Result<Vec<Attachment>> {
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().trim_text(true);
+    let mut in_attachment = false;
+    let mut current = String::new();
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    let mut attachments = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(event) => {
+                let name = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if name == "별표단위" {
+                    in_attachment = true;
+                    fields.clear();
+                    current.clear();
+                } else if in_attachment {
+                    current = name;
+                }
+            }
+            Event::Text(text) if in_attachment && !current.is_empty() => {
+                let value = text.decode()?.trim().to_string();
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_insert(value);
+                }
+            }
+            Event::CData(text) if in_attachment && !current.is_empty() => {
+                let value = text.decode()?.trim().to_string();
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_insert(value);
+                }
+            }
+            Event::End(event) => {
+                let name = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if name == "별표단위" {
+                    if let Some(attachment) = attachment_from_fields(&fields) {
+                        attachments.push(attachment);
+                    }
+                    in_attachment = false;
+                    current.clear();
+                    fields.clear();
+                } else if in_attachment {
+                    current.clear();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(attachments)
+}
+
+fn attachment_from_fields(fields: &BTreeMap<String, String>) -> Option<Attachment> {
+    let file_link = nfc(fields.get("별표첨부파일명")?).trim().to_string();
+    if file_link.is_empty() {
+        return None;
+    }
+    let kind = attachment_field(fields, "별표구분");
+    Some(Attachment {
+        bylaw_no: attachment_field(fields, "별표번호"),
+        branch_no: attachment_field(fields, "별표가지번호"),
+        kind: if kind.is_empty() {
+            "별표".to_string()
+        } else {
+            kind
+        },
+        title: attachment_field(fields, "별표제목"),
+        file_type: attachment_field(fields, "별표첨부파일구분").to_lowercase(),
+        file_link,
+    })
+}
+
+fn attachment_field(fields: &BTreeMap<String, String>, key: &str) -> String {
+    fields
+        .get(key)
+        .map(|value| text_value(value))
+        .unwrap_or_default()
 }
 
 fn normalize_article_number(value: &str) -> String {
@@ -504,6 +597,11 @@ fn format_date(raw: &str) -> String {
     }
 }
 
+fn is_epoch_clamped(raw: &str) -> bool {
+    let date = format_date(raw);
+    date.len() == 10 && date.as_str() < "1970-01-01"
+}
+
 /// Render article Markdown compatible with the Python converter for flat
 /// article bodies.
 fn render_articles(articles: &[Article]) -> String {
@@ -531,6 +629,34 @@ fn strip_article_prefix(content: &str, no: &str, title: &str) -> String {
         }
     }
     content.trim().to_string()
+}
+
+fn public_source_url(ordinance: &Ordinance) -> String {
+    let compact_name = ordinance.name.replace(' ', "");
+    if compact_name.is_empty() {
+        String::new()
+    } else {
+        format!("https://www.law.go.kr/자치법규/{compact_name}")
+    }
+}
+
+fn render_attachments_yaml(attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return "첨부파일: []\n".to_string();
+    }
+    let mut out = String::from("첨부파일:\n");
+    for attachment in attachments {
+        out.push_str(&format!(
+            "  - 별표번호: {}\n    별표가지번호: {}\n    별표구분: {}\n    제목: {}\n    파일형식: {}\n    파일링크: {}\n",
+            yaml_string(&attachment.bylaw_no),
+            yaml_string(&attachment.branch_no),
+            yaml_string(&attachment.kind),
+            yaml_string(&attachment.title),
+            yaml_string(&attachment.file_type),
+            yaml_string(&attachment.file_link),
+        ));
+    }
+    out
 }
 
 /// Render Markdown.
@@ -563,8 +689,9 @@ fn render_markdown(ordinance: &Ordinance) -> String {
     } else {
         "api-text"
     };
+    let attachments_yaml = render_attachments_yaml(&ordinance.attachments);
     format!(
-        "---\n자치법규ID: {}\n자치법규일련번호: {}\n자치법규명: {}\nordinance_type: {}\njurisdiction: {}\njurisdiction_split:\n  광역: {}\n  기초: {}\n공포일자: {}\n공포번호: {}\n시행일자: {}\n제개정구분: {}\n자치법규분야: {}\n담당부서: {}\nbody_source: {}\nhwp_sha256: null\nattachments_hwp: false\n출처: {}\nsource_url: {}\nattachments: []\nepoch_clamped: false\n공포일자_raw: {}\n---\n\n# {}\n\n{}\n",
+        "---\n자치법규ID: {}\n자치법규일련번호: {}\n자치법규명: {}\n자치법규종류: {}\n지자체기관명: {}\n지자체구분:\n  광역: {}\n  기초: {}\n공포일자: {}\n공포번호: {}\n시행일자: {}\n제개정구분: {}\n자치법규분야: {}\n담당부서: {}\n본문출처: {}\n출처: {}\n{}공포일자보정: {}\n공포일자원문: {}\n---\n\n# {}\n\n{}\n",
         yaml_string(&ordinance.id),
         yaml_string(&ordinance.serial),
         yaml_string(&ordinance.name),
@@ -579,14 +706,9 @@ fn render_markdown(ordinance: &Ordinance) -> String {
         yaml_string(&ordinance.field),
         yaml_string(&ordinance.department),
         yaml_string(body_source),
-        yaml_string(&format!(
-            "https://www.law.go.kr/자치법규/{}",
-            ordinance.name.replace(' ', "")
-        )),
-        yaml_string(&format!(
-            "https://www.law.go.kr/DRF/lawService.do?target=ordin&ID={}",
-            ordinance.id
-        )),
+        yaml_string(&public_source_url(ordinance)),
+        attachments_yaml,
+        is_epoch_clamped(&ordinance.prom_date_raw),
         yaml_string(&ordinance.prom_date_raw),
         ordinance.name,
         body
@@ -609,6 +731,7 @@ mod tests {
         let ordinance = parse_ordinance(xml.as_bytes(), "2000111").unwrap();
         assert_eq!(ordinance.ordinance_type, "조례");
         assert!(render_markdown(&ordinance).contains("기초: '_본청'"));
+        assert!(!render_markdown(&ordinance).contains("source_url:"));
     }
 
     #[test]
@@ -628,8 +751,21 @@ mod tests {
         let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>부칙 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><부칙><부칙내용>이 조례는 공포한 날부터 시행한다.</부칙내용></부칙></Ordin>";
         let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
         let markdown = render_markdown(&ordinance);
-        assert!(markdown.contains("body_source: 'api-text'"));
+        assert!(markdown.contains("본문출처: 'api-text'"));
         assert!(markdown.contains("## 부칙\n\n이 조례는 공포한 날부터 시행한다."));
+    }
+
+    #[test]
+    fn renders_attachment_links() {
+        let xml = "<Ordin><자치법규ID>1</자치법규ID><자치법규명>첨부 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><조문내용>제1조 목적</조문내용><별표><별표단위><별표번호>0001</별표번호><별표가지번호>00</별표가지번호><별표구분>서식</별표구분><별표제목><![CDATA[[별지 제1호서식] 신청서]]></별표제목><별표첨부파일구분>hwp</별표첨부파일구분><별표첨부파일명><![CDATA[http://www.law.go.kr/flDownload.do?gubun=ELIS&flSeq=1&flNm=test]]></별표첨부파일명></별표단위></별표></Ordin>";
+        let ordinance = parse_ordinance(xml.as_bytes(), "1").unwrap();
+        let markdown = render_markdown(&ordinance);
+        assert!(markdown.contains("첨부파일:\n  - 별표번호: '0001'"));
+        assert!(markdown.contains("별표구분: '서식'"));
+        assert!(markdown.contains("제목: '[별지 제1호서식] 신청서'"));
+        assert!(markdown.contains(
+            "파일링크: 'http://www.law.go.kr/flDownload.do?gubun=ELIS&flSeq=1&flNm=test'"
+        ));
     }
 
     #[test]
