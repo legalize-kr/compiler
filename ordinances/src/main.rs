@@ -256,45 +256,15 @@ fn commit_timestamp(raw: &str) -> Result<i64> {
 fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
     fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
     fs::write(output.join("README.md"), REPOSITORY_README)?;
-    let mut files = read_xml_files(cache_dir)?;
-    if let Some(limit) = limit {
-        files.truncate(limit);
-    }
-    let mut registry = PathRegistry::new();
-    let mut written = 0usize;
-    let mut skipped = 0usize;
-    for path in files {
-        let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let ordinance = match parse_ordinance(
-            &raw,
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or(""),
-        ) {
-            Ok(ordinance) => ordinance,
-            Err(err) => {
-                skipped += 1;
-                eprintln!(
-                    "skipping unparsable ordinance XML {}: {err:#}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        if !matches!(
-            ordinance.ordinance_type.as_str(),
-            "조례" | "규칙" | "훈령" | "예규" | "고시" | "의회규칙"
-        ) {
-            skipped += 1;
-            continue;
-        }
-        let rel = ordinance_path(&ordinance, &mut registry);
-        let target = output.join(rel);
+    let entries = render_ordinance_entries(cache_dir, limit)?;
+    for entry in &entries {
+        let target = output.join(&entry.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&target, render_markdown(&ordinance))?;
-        written += 1;
+        fs::write(&target, &entry.content)?;
     }
-    eprintln!("written {written} ordinance markdown files; skipped {skipped}");
+    eprintln!("written {} ordinance markdown files", entries.len());
     Ok(())
 }
 
@@ -940,6 +910,34 @@ mod tests {
                 .join("서울특별시/_본청/조례/서울특별시 테스트 조례/본문.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn compile_dir_applies_revisions_in_promulgation_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(
+            cache.join("100.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>2</자치법규일련번호><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240504</공포일자><공포번호>2</공포번호><조문내용>최신 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        fs::write(
+            cache.join("200.xml"),
+            "<Ordin><자치법규ID>2000111</자치법규ID><자치법규일련번호>1</자치법규일련번호><자치법규명>서울특별시 테스트 조례</자치법규명><자치법규종류>C0001</자치법규종류><지자체기관명>서울특별시</지자체기관명><공포일자>20240101</공포일자><공포번호>1</공포번호><조문내용>이전 본문</조문내용></Ordin>",
+        )
+        .unwrap();
+        let output = temp.path().join("out");
+
+        compile_dir(&cache, &output, None).unwrap();
+
+        let markdown =
+            fs::read_to_string(output.join("서울특별시/_본청/조례/서울특별시 테스트 조례/본문.md"))
+                .unwrap();
+        assert!(markdown.contains("공포일자: 2024-05-04"));
+        assert!(markdown.contains("공포번호: '2'"));
+        assert!(markdown.contains("최신 본문"));
+        assert!(!markdown.contains("이전 본문"));
     }
 
     #[test]
