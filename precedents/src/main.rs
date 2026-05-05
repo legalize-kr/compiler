@@ -21,8 +21,8 @@ use rayon::prelude::*;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
 use crate::render::{
-    PathRegistry, build_commit_message, get_precedent_path, legacy_get_precedent_path,
-    precedent_to_markdown,
+    PathRegistry, build_commit_message, format_judgment_date, get_precedent_path,
+    legacy_get_precedent_path, precedent_to_markdown,
 };
 use crate::xml_parser::{
     PrecedentDetail, PrecedentMetadata, parse_metadata_only, parse_precedent_body,
@@ -35,7 +35,7 @@ const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
 const REPOSITORY_GITIGNORE: &[u8] = b"metadata.json\nstats.json\n";
 
 /// Global allocator tuned for high-throughput allocation-heavy pack generation.
-#[cfg(feature = "default")]
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -399,18 +399,20 @@ fn timestamp_from_judgment_date(judgment_date: &str) -> Result<GitTimestampKst> 
         return Ok(GitTimestampKst::from_epoch(0));
     }
     if judgment_date.len() != 8 || !judgment_date.bytes().all(|byte| byte.is_ascii_digit()) {
-        anyhow::bail!("expected judgment date in YYYYMMDD form: {judgment_date}");
+        return Ok(GitTimestampKst::from_epoch(0));
     }
 
-    let effective_date = if judgment_date < "19700101" {
+    let effective_date = if judgment_date.starts_with("0000") || judgment_date.starts_with("0001") {
         String::from("1970-01-01")
     } else {
-        format!(
-            "{}-{}-{}",
-            &judgment_date[..4],
-            &judgment_date[4..6],
-            &judgment_date[6..8]
-        )
+        let Some(formatted) = format_judgment_date(judgment_date) else {
+            return Ok(GitTimestampKst::from_epoch(0));
+        };
+        if formatted.as_str() < "1970-01-01" {
+            String::from("1970-01-01")
+        } else {
+            formatted
+        }
     };
 
     let year = effective_date[0..4].parse::<i32>()?;
@@ -463,6 +465,18 @@ mod tests {
     const SAMPLE_INVALID_HTML: &str = r#"<!DOCTYPE html>
 <html><body>error</body></html>
 "#;
+
+    const SAMPLE_INVALID_DATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<PrecService>
+  <판례정보일련번호>1003</판례정보일련번호>
+  <사건명><![CDATA[무효확인]]></사건명>
+  <사건번호><![CDATA[2024구합1]]></사건번호>
+  <선고일자>20241301</선고일자>
+  <법원명>대법원</법원명>
+  <법원종류코드>400201</법원종류코드>
+  <사건종류명>일반행정</사건종류명>
+  <판례내용><![CDATA[본문]]></판례내용>
+</PrecService>"#;
 
     fn write_sample(cache_dir: &Path, serial: &str, xml: &str) {
         fs::write(cache_dir.join(format!("{serial}.xml")), xml).unwrap();
@@ -571,9 +585,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_compact_judgment_dates() {
-        let error = timestamp_from_judgment_date("2024-01-01").unwrap_err();
-        assert!(error.to_string().contains("YYYYMMDD"));
+    fn malformed_judgment_dates_do_not_abort_timestamping() {
+        assert!(timestamp_from_judgment_date("2024-01-01").is_ok());
+        assert!(timestamp_from_judgment_date("20241301").is_ok());
+    }
+
+    #[test]
+    fn invalid_judgment_date_renders_with_missing_date_fallback() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join(".cache").join("precedent");
+        fs::create_dir_all(&cache_dir).unwrap();
+        write_sample(&cache_dir, "1003", SAMPLE_INVALID_DATE);
+
+        let output = temp.path().join("output.git");
+        run(Cli {
+            cache_dir,
+            output: output.clone(),
+            emit_legacy_paths: None,
+            legacy_precedent_root: None,
+        })
+        .unwrap();
+
+        let path = "일반행정/대법원/대법원_0000-00-00_2024구합1.md";
+        let markdown = git_stdout(&output, ["show", &format!("HEAD:{path}")]);
+        assert!(markdown.contains("판례일련번호: '1003'"));
+        assert!(!markdown.contains("선고일자:"));
     }
 
     #[test]

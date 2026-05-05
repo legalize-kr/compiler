@@ -92,6 +92,23 @@ pub struct Addendum {
     pub content: String,
 }
 
+/// Attachment link metadata extracted from one 별표 block.
+#[derive(Debug, Clone, Default)]
+pub struct Attachment {
+    /// 별표번호.
+    pub bylaw_no: String,
+    /// 별표가지번호.
+    pub branch_no: String,
+    /// 별표구분.
+    pub kind: String,
+    /// 별표제목.
+    pub title: String,
+    /// HWP or original-format download link.
+    pub file_link: String,
+    /// PDF download link.
+    pub pdf_link: String,
+}
+
 /// Fully parsed law document ready for Markdown rendering.
 #[derive(Debug, Clone, Default)]
 pub struct LawDetail {
@@ -101,6 +118,8 @@ pub struct LawDetail {
     pub articles: Vec<Article>,
     /// Parsed addenda list.
     pub addenda: Vec<Addendum>,
+    /// Parsed 별표 attachment links.
+    pub attachments: Vec<Attachment>,
 }
 
 /// Pass-2 article and addendum body extracted from a law XML document.
@@ -110,6 +129,8 @@ pub struct LawBody {
     pub articles: Vec<Article>,
     /// Parsed addenda list.
     pub addenda: Vec<Addendum>,
+    /// Parsed 별표 attachment links.
+    pub attachments: Vec<Attachment>,
 }
 
 /// Minimal DOM node used for the full pass-2 XML walk.
@@ -140,6 +161,11 @@ impl XmlNode {
             .find(|child| child.name == name)
             .map(|child| child.text.clone())
             .unwrap_or_default()
+    }
+
+    /// Returns trimmed direct child text for the first matching element name.
+    fn child_trimmed(&self, name: &str) -> String {
+        self.child_text(name).trim().to_owned()
     }
 
     /// Collects every descendant node whose element name matches `name`.
@@ -316,6 +342,7 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
     let mut body = LawBody {
         articles: Vec::new(),
         addenda: Vec::new(),
+        attachments: Vec::new(),
     };
 
     //
@@ -383,7 +410,62 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
         });
     }
 
+    let mut attachment_nodes = Vec::new();
+    root.collect_descendants("별표단위", &mut attachment_nodes);
+    for node in attachment_nodes {
+        let file_link = first_link(
+            &node.child_trimmed("별표서식파일링크"),
+            &node.child_trimmed("별표파일링크"),
+        );
+        let pdf_link = first_link(
+            &node.child_trimmed("별표서식PDF파일링크"),
+            &node.child_trimmed("별표PDF파일링크"),
+        );
+        if file_link.is_empty() && pdf_link.is_empty() {
+            continue;
+        }
+        body.attachments.push(Attachment {
+            bylaw_no: node.child_trimmed("별표번호"),
+            branch_no: node.child_trimmed("별표가지번호"),
+            kind: {
+                let kind = node.child_trimmed("별표구분");
+                if kind.is_empty() {
+                    String::from("별표")
+                } else {
+                    kind
+                }
+            },
+            title: node.child_trimmed("별표제목"),
+            file_link,
+            pdf_link,
+        });
+    }
+
     Ok(body)
+}
+
+/// Picks the first non-empty attachment link and normalizes it to an absolute URL.
+fn first_link(primary: &str, fallback: &str) -> String {
+    let value = if primary.is_empty() {
+        fallback
+    } else {
+        primary
+    };
+    absolute_law_url(value)
+}
+
+/// Converts a law.go.kr relative attachment path into an absolute URL.
+fn absolute_law_url(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        String::new()
+    } else if value.starts_with('/') {
+        format!("https://www.law.go.kr{value}")
+    } else if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_owned()
+    } else {
+        format!("https://www.law.go.kr/{value}")
+    }
 }
 
 /// Decodes one XML element name from UTF-8 bytes.
@@ -545,5 +627,36 @@ mod tests {
         let body = parse_law_body(xml.as_bytes()).unwrap();
         assert_eq!(body.articles[0].kind, "전문");
         assert_eq!(body.articles[1].kind, "조문");
+    }
+
+    #[test]
+    fn parses_attachment_links() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <별표>
+    <별표단위>
+      <별표번호>0001</별표번호>
+      <별표가지번호>00</별표가지번호>
+      <별표구분>별표</별표구분>
+      <별표제목><![CDATA[수수료]]></별표제목>
+      <별표서식파일링크>/LSW/flDownload.do?flSeq=1</별표서식파일링크>
+      <별표서식PDF파일링크>/LSW/flDownload.do?flSeq=2</별표서식PDF파일링크>
+    </별표단위>
+  </별표>
+</법령>"#;
+
+        let body = parse_law_body(xml.as_bytes()).unwrap();
+
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].bylaw_no, "0001");
+        assert_eq!(body.attachments[0].kind, "별표");
+        assert_eq!(
+            body.attachments[0].file_link,
+            "https://www.law.go.kr/LSW/flDownload.do?flSeq=1"
+        );
+        assert_eq!(
+            body.attachments[0].pdf_link,
+            "https://www.law.go.kr/LSW/flDownload.do?flSeq=2"
+        );
     }
 }

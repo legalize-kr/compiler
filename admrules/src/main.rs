@@ -64,8 +64,21 @@ struct Admrule {
     amendment_code: String,
     /// 현행연혁구분.
     current_history: String,
+    /// 별표 attachment links.
+    attachments: Vec<Attachment>,
     /// Body text.
     body: String,
+}
+
+/// Parsed 별표 attachment link.
+#[derive(Debug, Clone)]
+struct Attachment {
+    bylaw_no: String,
+    branch_no: String,
+    kind: String,
+    title: String,
+    file_link: String,
+    pdf_link: String,
 }
 
 /// 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC.
@@ -242,6 +255,7 @@ fn read_xml_files(cache_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Parse a cached XML document with a flat tag text map.
 fn parse_admrule(raw: &[u8], fallback_serial: &str) -> Result<Admrule> {
     let fields = tag_texts(raw)?;
+    let attachments = collect_attachments(raw)?;
     let serial = first(&fields, &["행정규칙일련번호", "ID"])
         .unwrap_or(fallback_serial)
         .to_string();
@@ -287,6 +301,7 @@ fn parse_admrule(raw: &[u8], fallback_serial: &str) -> Result<Admrule> {
             .unwrap_or("")
             .to_string(),
         current_history: first(&fields, &["현행연혁구분"]).unwrap_or("").to_string(),
+        attachments,
         body,
     })
 }
@@ -337,6 +352,117 @@ fn collect_body(fields: &BTreeMap<String, Vec<String>>, keys: &[&str]) -> String
         }
     }
     parts.join("\n\n")
+}
+
+/// Extract structured 별표 download links without writing binary files.
+fn collect_attachments(raw: &[u8]) -> Result<Vec<Attachment>> {
+    let mut reader = Reader::from_reader(raw);
+    reader.config_mut().trim_text(true);
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    let mut attachments = Vec::new();
+    let mut current = String::new();
+    let mut in_attachment = false;
+    let mut attachment_root = String::new();
+    let mut depth = 0usize;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(event) => {
+                let tag = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if !in_attachment && matches!(tag.as_str(), "별표" | "별표단위") {
+                    in_attachment = true;
+                    attachment_root = tag;
+                    depth = 1;
+                    fields.clear();
+                    current.clear();
+                } else if in_attachment {
+                    depth += 1;
+                    current = tag;
+                }
+            }
+            Event::Text(text) if in_attachment && !current.is_empty() => {
+                let value = nfc(text.decode()?.trim());
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_insert(value);
+                }
+            }
+            Event::CData(text) if in_attachment && !current.is_empty() => {
+                let value = nfc(text.decode()?.trim());
+                if !value.is_empty() {
+                    fields.entry(current.clone()).or_insert(value);
+                }
+            }
+            Event::End(event) if in_attachment => {
+                let tag = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if depth == 1 && tag == attachment_root {
+                    if let Some(attachment) = attachment_from_fields(&fields, attachments.len()) {
+                        attachments.push(attachment);
+                    }
+                    in_attachment = false;
+                    attachment_root.clear();
+                    current.clear();
+                    depth = 0;
+                } else {
+                    depth = depth.saturating_sub(1);
+                    current.clear();
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(attachments)
+}
+
+fn attachment_from_fields(fields: &BTreeMap<String, String>, index: usize) -> Option<Attachment> {
+    let file_link = absolute_law_url(first_attachment(
+        fields,
+        &["별표서식파일링크", "별표파일링크"],
+    ));
+    let pdf_link = absolute_law_url(first_attachment(
+        fields,
+        &["별표서식PDF파일링크", "별표PDF파일링크"],
+    ));
+    if file_link.is_empty() && pdf_link.is_empty() {
+        return None;
+    }
+    Some(Attachment {
+        bylaw_no: first_attachment(fields, &["별표번호"])
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("별표 {}", index + 1)),
+        branch_no: first_attachment(fields, &["별표가지번호"])
+            .unwrap_or("")
+            .to_string(),
+        kind: first_attachment(fields, &["별표구분"])
+            .filter(|value| !value.is_empty())
+            .unwrap_or("별표")
+            .to_string(),
+        title: first_attachment(fields, &["별표제목", "별표명"])
+            .unwrap_or("")
+            .to_string(),
+        file_link,
+        pdf_link,
+    })
+}
+
+fn first_attachment<'a>(fields: &'a BTreeMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| fields.get(*key).map(String::as_str))
+}
+
+fn absolute_law_url(value: Option<&str>) -> String {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        String::new()
+    } else if value.starts_with('/') {
+        format!("https://www.law.go.kr{value}")
+    } else if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("https://www.law.go.kr/{value}")
+    }
 }
 
 /// NFC-normalize a string.
@@ -682,6 +808,35 @@ fn issue_date(raw: &str) -> (String, bool) {
     }
 }
 
+fn render_attachments_yaml(attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return "첨부파일: []\n".to_string();
+    }
+    let mut out = String::from("첨부파일:\n");
+    for attachment in attachments {
+        out.push_str(&format!(
+            "- 별표번호: {}\n  별표가지번호: {}\n  별표구분: {}\n  제목: {}\n",
+            yaml_string(&attachment.bylaw_no),
+            yaml_string(&attachment.branch_no),
+            yaml_string(&attachment.kind),
+            yaml_string(&attachment.title),
+        ));
+        if !attachment.file_link.is_empty() {
+            out.push_str(&format!(
+                "  파일링크: {}\n",
+                yaml_string(&attachment.file_link)
+            ));
+        }
+        if !attachment.pdf_link.is_empty() {
+            out.push_str(&format!(
+                "  PDF링크: {}\n",
+                yaml_string(&attachment.pdf_link)
+            ));
+        }
+    }
+    out
+}
+
 /// Render Markdown.
 fn render_markdown(rule: &Admrule) -> String {
     let (issue_date, epoch_clamped) = issue_date(&rule.issue_date_raw);
@@ -713,8 +868,9 @@ fn render_markdown(rule: &Admrule) -> String {
             .collect::<String>();
         format!("기관경로:\n{items}")
     };
+    let attachments_yaml = render_attachments_yaml(&rule.attachments);
     format!(
-        "---\n행정규칙ID: {}\n행정규칙일련번호: {}\n행정규칙명: {}\n행정규칙종류: {}\n상위기관명: {}\n소관부처명: {}\n{}{}기관코드: {}\n발령번호: {}\n발령일자: {}\n시행일자: {}\n제개정구분: {}\n제개정구분코드: {}\n현행연혁구분: {}\nbody_source: {}\nhwp_sha256: null\nattachments_hwp: false\n출처: {}\nsource_url: ''\nattachments: []\nepoch_clamped: {}\n발령일자_raw: {}\n---\n\n{}\n",
+        "---\n행정규칙ID: {}\n행정규칙일련번호: {}\n행정규칙명: {}\n행정규칙종류: {}\n상위기관명: {}\n소관부처명: {}\n{}{}기관코드: {}\n발령번호: {}\n발령일자: {}\n시행일자: {}\n제개정구분: {}\n제개정구분코드: {}\n현행연혁구분: {}\nbody_source: {}\nhwp_sha256: null\nattachments_hwp: false\n출처: {}\nsource_url: ''\n{}epoch_clamped: {}\n발령일자_raw: {}\n---\n\n{}\n",
         yaml_string(&rule.rule_id),
         yaml_string(&rule.serial),
         yaml_string(&rule.name),
@@ -735,6 +891,7 @@ fn render_markdown(rule: &Admrule) -> String {
             "https://www.law.go.kr/행정규칙/{}",
             rule.name.replace(' ', "")
         )),
+        attachments_yaml,
         epoch_clamped,
         yaml_string(&rule.issue_date_raw),
         body
@@ -765,6 +922,7 @@ mod tests {
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
         assert_eq!(rule.name, "테스트 고시");
         assert!(render_markdown(&rule).contains("발령일자: 2024-05-04"));
+        assert!(render_markdown(&rule).contains("첨부파일: []"));
     }
 
     #[test]
@@ -773,6 +931,22 @@ mod tests {
         let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
         assert_eq!(rule.name, "CDATA 고시");
         assert_eq!(rule.body, "제1조 목적");
+    }
+
+    #[test]
+    fn parses_and_renders_attachment_links() {
+        let xml = "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>첨부 고시</행정규칙명><행정규칙종류>고시</행정규칙종류><소관부처명>행정안전부</소관부처명><발령일자>20240504</발령일자><조문내용>제1조 목적</조문내용><별표><별표번호>0001</별표번호><별표가지번호>00</별표가지번호><별표구분>별표</별표구분><별표제목><![CDATA[수수료]]></별표제목><별표서식파일링크>/LSW/flDownload.do?flSeq=1</별표서식파일링크><별표서식PDF파일링크>/LSW/flDownload.do?flSeq=2</별표서식PDF파일링크></별표></AdmRulService>";
+        let rule = parse_admrule(xml.as_bytes(), "123").unwrap();
+
+        assert_eq!(rule.attachments.len(), 1);
+        assert_eq!(
+            rule.attachments[0].file_link,
+            "https://www.law.go.kr/LSW/flDownload.do?flSeq=1"
+        );
+        let markdown = render_markdown(&rule);
+        assert!(markdown.contains("첨부파일:\n- 별표번호: '0001'"));
+        assert!(markdown.contains("파일링크: 'https://www.law.go.kr/LSW/flDownload.do?flSeq=1'"));
+        assert!(markdown.contains("PDF링크: 'https://www.law.go.kr/LSW/flDownload.do?flSeq=2'"));
     }
 
     #[test]

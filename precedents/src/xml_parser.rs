@@ -63,7 +63,8 @@ pub struct PrecedentDetail {
 /// Parses only the metadata fields needed for pass-1 ordering and path planning.
 ///
 /// Returns `Ok(None)` when the document is not a `PrecService` payload (for example,
-/// upstream HTML error pages) or the serial is empty.
+/// upstream HTML error pages), the cache filename serial is empty, or the XML omits
+/// `판례정보일련번호`.
 pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentMetadata>> {
     if serial.is_empty() {
         return Ok(None);
@@ -76,10 +77,7 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
     let mut capture_tag: Option<String> = None;
     let mut capture_text = String::new();
     let mut root_seen = false;
-    let mut metadata = PrecedentMetadata {
-        serial: serial.to_owned(),
-        ..PrecedentMetadata::default()
-    };
+    let mut metadata = PrecedentMetadata::default();
 
     loop {
         match reader.read_event_into(&mut buf)? {
@@ -98,6 +96,7 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
                 // later duplicates untouched.
                 //
                 let should_capture = match tag.as_str() {
+                    "판례정보일련번호" => metadata.serial.is_empty(),
                     "사건번호" => metadata.case_no.is_empty(),
                     "사건명" => metadata.case_name.is_empty(),
                     "법원명" => metadata.court_name.is_empty(),
@@ -117,7 +116,7 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
                     if tag != "PrecService" {
                         return Ok(None);
                     }
-                    return Ok(Some(metadata));
+                    return Ok(None);
                 }
             }
             Event::Text(text) if capture_tag.is_some() => {
@@ -132,6 +131,7 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
                     && current == &tag
                 {
                     match current.as_str() {
+                        "판례정보일련번호" => metadata.serial = capture_text.clone(),
                         "사건번호" => metadata.case_no = capture_text.clone(),
                         "사건명" => metadata.case_name = capture_text.clone(),
                         "법원명" => metadata.court_name = capture_text.clone(),
@@ -153,6 +153,15 @@ pub fn parse_metadata_only(xml: &[u8], serial: &str) -> Result<Option<PrecedentM
 
     if !root_seen {
         return Ok(None);
+    }
+    if metadata.serial.is_empty() {
+        return Ok(None);
+    }
+    if metadata.serial != serial {
+        anyhow::bail!(
+            "판례정보일련번호 {} does not match cache filename serial {serial}",
+            metadata.serial
+        );
     }
     Ok(Some(metadata))
 }
@@ -309,6 +318,22 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn returns_none_when_xml_serial_is_missing() {
+        let xml = SAMPLE_PREC_XML.replace("  <판례정보일련번호>145683</판례정보일련번호>\n", "");
+        assert!(
+            parse_metadata_only(xml.as_bytes(), "145683")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_xml_serial_mismatch() {
+        let error = parse_metadata_only(SAMPLE_PREC_XML.as_bytes(), "999999").unwrap_err();
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]

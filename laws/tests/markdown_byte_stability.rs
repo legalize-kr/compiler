@@ -53,6 +53,7 @@ const EXPECTED_CONTENT: &str = "---
 법령분야: ''
 상태: 시행
 출처: https://www.law.go.kr/법령/테스트법
+첨부파일: []
 ---
 
 # 테스트법

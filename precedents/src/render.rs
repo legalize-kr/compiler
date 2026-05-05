@@ -6,6 +6,7 @@ use anyhow::Result;
 use regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
+use time::{Date, Month};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::xml_parser::{
@@ -338,6 +339,10 @@ pub fn format_judgment_date(date_str: &str) -> Option<String> {
     if year_prefix == "0000" || year_prefix == "0001" {
         return None;
     }
+    let year = year_prefix.parse::<i32>().ok()?;
+    let month = Month::try_from(date_str[4..6].parse::<u8>().ok()?).ok()?;
+    let day = date_str[6..8].parse::<u8>().ok()?;
+    Date::from_calendar_date(year, month, day).ok()?;
     Some(format!(
         "{}-{}-{}",
         &date_str[..4],
@@ -360,6 +365,7 @@ pub fn precedent_to_markdown(detail: &PrecedentDetail) -> Result<Vec<u8>> {
             "https://www.law.go.kr/LSW/precInfoP.do?precSeq={}",
             detail.metadata.serial
         ),
+        attachments: Vec::new(),
         judgment_date: format_judgment_date(&detail.metadata.judgment_date),
     };
     let mut yaml = serde_yaml::to_string(&frontmatter)?;
@@ -448,6 +454,9 @@ struct Frontmatter<'a> {
     /// 출처 URL.
     #[serde(rename = "출처")]
     source: String,
+    /// Structured attachment links. PrecService currently has no separate attachment fields.
+    #[serde(rename = "첨부파일")]
+    attachments: Vec<String>,
     /// 선고일자 (`YYYY-MM-DD`), omitted when missing.
     #[serde(rename = "선고일자", skip_serializing_if = "Option::is_none")]
     judgment_date: Option<String>,
@@ -647,9 +656,16 @@ mod tests {
             format_judgment_date("20240101").as_deref(),
             Some("2024-01-01")
         );
+        assert_eq!(
+            format_judgment_date("20240229").as_deref(),
+            Some("2024-02-29")
+        );
         assert_eq!(format_judgment_date(""), None);
         assert_eq!(format_judgment_date("00000101"), None);
         assert_eq!(format_judgment_date("0001-01"), None);
+        assert_eq!(format_judgment_date("20230229"), None);
+        assert_eq!(format_judgment_date("20241301"), None);
+        assert_eq!(format_judgment_date("20240231"), None);
     }
 
     #[test]
@@ -676,6 +692,7 @@ mod tests {
         assert!(markdown.contains("판례일련번호: '145683'"));
         assert!(markdown.contains("법원등급: 대법원"));
         assert!(markdown.contains("2003-11-14"));
+        assert!(markdown.contains("첨부파일: []"));
         assert!(markdown.contains("# 손해배상"));
         assert!(markdown.contains("## 판시사항"));
         assert!(markdown.contains("판시 본문"));

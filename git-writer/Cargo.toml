@@ -16,7 +16,8 @@ libdeflater = { workspace = true, optional = true }
 doctest = false
 
 [features]
-default = ["dep:libdeflater"]
+default = ["libdeflater"]
+libdeflater = ["dep:libdeflater"]
 
 [dev-dependencies]
 tempfile.workspace = true

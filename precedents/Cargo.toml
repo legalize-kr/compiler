@@ -23,7 +23,8 @@ mimalloc = { workspace = true, optional = true }
 doctest = false
 
 [features]
-default = ["dep:mimalloc"]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 proptest.workspace = true

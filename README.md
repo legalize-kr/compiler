@@ -20,10 +20,10 @@ compiler/
 └── precedents/        # 판례 컴파일러 (binary: precedent-kr-compiler)
 ```
 
-각 멤버는 독립 패키지이며 자체 README를 가집니다:
+멤버별 사용 문서와 생성 저장소 README 원본은 다음 위치에 있습니다:
 
-- 법령: [`laws/README.md`](laws/README.md)
-- 판례: [`precedents/README.md`](precedents/README.md)
+- 법령 컴파일러: [`laws/README.md`](laws/README.md)
+- 판례 컴파일러: [`precedents/README.md`](precedents/README.md)
 - 행정규칙 결과 README: [`admrules/assets/README.md`](admrules/assets/README.md)
 - 자치법규 결과 README: [`ordinances/assets/README.md`](ordinances/assets/README.md)
 

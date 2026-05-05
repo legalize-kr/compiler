@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use serde::Serialize;
 
 use crate::git_repo::RepoPathBuf;
-use crate::xml_parser::{LawDetail, LawMetadata};
+use crate::xml_parser::{Attachment, LawDetail, LawMetadata};
 
 /// Child-law suffixes that share a parent directory in the output tree.
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
@@ -263,6 +263,11 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
             field: prepared.field.clone(),
             status: String::from("시행"),
             source: format!("https://www.law.go.kr/법령/{}", prepared.compact_name),
+            attachments: detail
+                .attachments
+                .iter()
+                .map(AttachmentFrontmatter::from)
+                .collect(),
             original_title: (prepared.normalized_name != prepared.raw_name)
                 .then_some(prepared.raw_name.clone()),
         }
@@ -530,14 +535,54 @@ struct Frontmatter {
     /// Canonical law.go.kr source URL.
     #[serde(rename = "출처")]
     source: String,
+    /// 별표/서식 attachment links.
+    #[serde(rename = "첨부파일")]
+    attachments: Vec<AttachmentFrontmatter>,
     /// Original unnormalized title when punctuation had to be rewritten.
     #[serde(rename = "원본제목", skip_serializing_if = "Option::is_none")]
     original_title: Option<String>,
 }
 
+/// YAML frontmatter payload for one 별표 attachment link.
+#[derive(Debug, Serialize)]
+struct AttachmentFrontmatter {
+    /// 별표번호.
+    #[serde(rename = "별표번호")]
+    bylaw_no: String,
+    /// 별표가지번호.
+    #[serde(rename = "별표가지번호")]
+    branch_no: String,
+    /// 별표구분.
+    #[serde(rename = "별표구분")]
+    kind: String,
+    /// 별표제목.
+    #[serde(rename = "제목")]
+    title: String,
+    /// HWP/original-format download link.
+    #[serde(rename = "파일링크", skip_serializing_if = "String::is_empty")]
+    file_link: String,
+    /// PDF download link.
+    #[serde(rename = "PDF링크", skip_serializing_if = "String::is_empty")]
+    pdf_link: String,
+}
+
+impl From<&Attachment> for AttachmentFrontmatter {
+    fn from(attachment: &Attachment) -> Self {
+        Self {
+            bylaw_no: attachment.bylaw_no.clone(),
+            branch_no: attachment.branch_no.clone(),
+            kind: attachment.kind.clone(),
+            title: attachment.title.clone(),
+            file_link: attachment.file_link.clone(),
+            pdf_link: attachment.pdf_link.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::xml_parser::Article;
+    use crate::xml_parser::Attachment;
     use crate::xml_parser::{Addendum, Paragraph, Subparagraph};
 
     use super::*;
@@ -676,6 +721,7 @@ mod tests {
             addenda: vec![Addendum {
                 content: String::from("    부칙 본문"),
             }],
+            attachments: Vec::new(),
         };
 
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
@@ -727,6 +773,7 @@ mod tests {
                 }],
             }],
             addenda: Vec::new(),
+            attachments: Vec::new(),
         };
 
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
@@ -788,6 +835,7 @@ mod tests {
                 },
             ],
             addenda: Vec::new(),
+            attachments: Vec::new(),
         };
 
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
@@ -844,6 +892,7 @@ mod tests {
                 },
             ],
             addenda: Vec::new(),
+            attachments: Vec::new(),
         };
 
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
@@ -889,6 +938,37 @@ mod tests {
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
         assert!(markdown.contains("소관부처: []"));
         assert!(!markdown.contains("소관부처:\n- ''"));
+    }
+
+    #[test]
+    fn markdown_renders_attachment_frontmatter() {
+        let detail = LawDetail {
+            metadata: LawMetadata {
+                mst: String::from("1"),
+                law_name: String::from("테스트법"),
+                law_id: String::from("000001"),
+                law_type: String::from("법률"),
+                promulgation_date: String::from("20240101"),
+                promulgation_number: String::from("00001"),
+                enforcement_date: String::from("20240101"),
+                department_name: String::from("법무부"),
+                ..LawMetadata::default()
+            },
+            attachments: vec![Attachment {
+                bylaw_no: String::from("0001"),
+                branch_no: String::from("00"),
+                kind: String::from("별표"),
+                title: String::from("수수료"),
+                file_link: String::from("https://www.law.go.kr/LSW/flDownload.do?flSeq=1"),
+                pdf_link: String::from("https://www.law.go.kr/LSW/flDownload.do?flSeq=2"),
+            }],
+            ..LawDetail::default()
+        };
+
+        let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
+        assert!(markdown.contains("첨부파일:\n- 별표번호: '0001'"));
+        assert!(markdown.contains("파일링크: https://www.law.go.kr/LSW/flDownload.do?flSeq=1"));
+        assert!(markdown.contains("PDF링크: https://www.law.go.kr/LSW/flDownload.do?flSeq=2"));
     }
 
     #[test]

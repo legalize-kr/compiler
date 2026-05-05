@@ -41,6 +41,7 @@ const EXPECTED_CONTENT: &str = "---
 법원등급: 대법원
 사건종류: 민사
 출처: https://www.law.go.kr/LSW/precInfoP.do?precSeq=100001
+첨부파일: []
 선고일자: 2020-03-10
 ---
 

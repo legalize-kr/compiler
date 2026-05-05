@@ -548,6 +548,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
         metadata: entry.metadata.clone(),
         articles: body.articles,
         addenda: body.addenda,
+        attachments: body.attachments,
     };
     let time = GitTimestampKst::from_promulgation_date(&detail.metadata.promulgation_date)?;
 
