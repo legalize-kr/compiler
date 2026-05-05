@@ -544,6 +544,9 @@ fn canonical_ministry_name(value: &str) -> Option<&'static str> {
         "여성가족부" => Some("성평등가족부"),
         "식품의약품안전청" => Some("식품의약품안전처"),
         "평생교육진흥원" => Some("국가평생교육진흥원"),
+        "중앙민방위방재교육원" | "국가민방위재난안전교육원" => {
+            Some("국가재난안전교육원")
+        }
         _ => None,
     }
 }
@@ -705,6 +708,7 @@ fn legal_parent_agency(value: &str) -> Option<&'static str> {
         "민주평화통일자문회의사무처" => Some("대통령"),
         "수도권매립지관리공사" => Some("기후에너지환경부"),
         "국가평생교육진흥원" => Some("교육부"),
+        "국가재난안전교육원" | "국립재난안전연구원" => Some("행정안전부"),
         _ => None,
     }
 }
@@ -1089,6 +1093,14 @@ mod tests {
         );
         assert_eq!(normalize_ministry_name("행정자치부", ""), "행정안전부");
         assert_eq!(normalize_ministry_name("기획재정부", ""), "재정경제부");
+        assert_eq!(
+            normalize_ministry_name("중앙민방위방재교육원", ""),
+            "국가재난안전교육원"
+        );
+        assert_eq!(
+            normalize_ministry_name("국가민방위재난안전교육원", ""),
+            "국가재난안전교육원"
+        );
     }
 
     #[test]
@@ -1224,6 +1236,14 @@ mod tests {
             ["과학기술정보통신부", "국립전파연구원"]
         );
         assert_eq!(
+            resolve_org_path("국민안전처", "국립재난안전연구원"),
+            ["행정안전부", "국립재난안전연구원"]
+        );
+        assert_eq!(
+            resolve_org_path("국민안전처", "국가재난안전교육원"),
+            ["행정안전부", "국가재난안전교육원"]
+        );
+        assert_eq!(
             resolve_org_path("중앙전파관리소", "중앙전파관리소"),
             ["과학기술정보통신부", "중앙전파관리소"]
         );
@@ -1306,6 +1326,35 @@ mod tests {
         assert_eq!(
             admrule_path(&rule, &mut PathRegistry::new()),
             PathBuf::from("기후에너지환경부/_본부/훈령/하천에 관한 사무처리규정/본문.md")
+        );
+    }
+
+    #[test]
+    fn maps_abolished_safety_ministry_subagencies() {
+        let education_xml = "<AdmRulService><행정규칙일련번호>123</행정규칙일련번호><행정규칙명>중앙민방위방재교육원 위임·전결규정</행정규칙명><행정규칙종류>훈령</행정규칙종류><소관부처명>중앙민방위방재교육원</소관부처명><상위부처명>국민안전처</상위부처명><담당부서기관명>중앙민방위방재교육원</담당부서기관명><발령일자>20140414</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>";
+        let education_rule = parse_admrule(education_xml.as_bytes(), "123").unwrap();
+        assert_eq!(education_rule.top_ministry, "행정안전부");
+        assert_eq!(education_rule.ministry, "국가재난안전교육원");
+        assert_eq!(
+            education_rule.org_path,
+            ["행정안전부", "국가재난안전교육원"]
+        );
+        assert_eq!(education_rule.original_ministry, "중앙민방위방재교육원");
+        assert_eq!(
+            admrule_path(&education_rule, &mut PathRegistry::new()),
+            PathBuf::from(
+                "행정안전부/국가재난안전교육원/훈령/중앙민방위방재교육원 위임·전결규정/본문.md"
+            )
+        );
+
+        let research_xml = "<AdmRulService><행정규칙일련번호>124</행정규칙일련번호><행정규칙명>국립재난안전연구원 재난안전연구자문위원회 규정</행정규칙명><행정규칙종류>훈령</행정규칙종류><소관부처명>국립재난안전연구원</소관부처명><상위부처명>국민안전처</상위부처명><담당부서기관명>국립재난안전연구원</담당부서기관명><발령일자>20250619</발령일자><조문내용>제1조 목적</조문내용></AdmRulService>";
+        let research_rule = parse_admrule(research_xml.as_bytes(), "124").unwrap();
+        assert_eq!(research_rule.org_path, ["행정안전부", "국립재난안전연구원"]);
+        assert_eq!(
+            admrule_path(&research_rule, &mut PathRegistry::new()),
+            PathBuf::from(
+                "행정안전부/국립재난안전연구원/훈령/국립재난안전연구원 재난안전연구자문위원회 규정/본문.md"
+            )
         );
     }
 
