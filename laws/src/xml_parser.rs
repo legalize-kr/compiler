@@ -179,6 +179,47 @@ impl XmlNode {
     }
 }
 
+/// Builds one item from a `<목>` node.
+fn item_from_node(node: &XmlNode) -> Item {
+    Item {
+        number: node.child_text("목번호"),
+        branch_number: node.child_text("목가지번호"),
+        content: node.child_text("목내용"),
+    }
+}
+
+/// Collects subparagraphs and their items from either upstream item layout.
+fn subparagraphs_from_node(node: &XmlNode) -> Vec<Subparagraph> {
+    let mut subparagraphs = Vec::new();
+    let mut current_subparagraph = None;
+    collect_subparagraphs_and_items(node, &mut subparagraphs, &mut current_subparagraph);
+    subparagraphs
+}
+
+/// Walks descendants in source order so sibling `<목>` nodes attach to the preceding `<호>`.
+fn collect_subparagraphs_and_items(
+    node: &XmlNode,
+    subparagraphs: &mut Vec<Subparagraph>,
+    current_subparagraph: &mut Option<usize>,
+) {
+    for child in &node.children {
+        if child.name == "호" {
+            subparagraphs.push(Subparagraph {
+                number: child.child_text("호번호"),
+                branch_number: child.child_text("호가지번호"),
+                content: child.child_text("호내용"),
+                items: Vec::new(),
+            });
+            *current_subparagraph = Some(subparagraphs.len() - 1);
+        } else if child.name == "목"
+            && let Some(index) = *current_subparagraph
+        {
+            subparagraphs[index].items.push(item_from_node(child));
+        }
+        collect_subparagraphs_and_items(child, subparagraphs, current_subparagraph);
+    }
+}
+
 /// Parses only the metadata fields needed for pass-1 ordering and path planning.
 pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
     //
@@ -363,35 +404,12 @@ pub fn parse_law_body(xml: &[u8]) -> Result<LawBody> {
         let mut paragraph_nodes = Vec::new();
         node.collect_descendants("항", &mut paragraph_nodes);
         for paragraph_node in paragraph_nodes {
-            let mut paragraph = Paragraph {
+            let paragraph = Paragraph {
                 number: paragraph_node.child_text("항번호"),
                 branch_number: paragraph_node.child_text("항가지번호"),
                 content: paragraph_node.child_text("항내용"),
-                subparagraphs: Vec::new(),
+                subparagraphs: subparagraphs_from_node(paragraph_node),
             };
-
-            let mut subparagraph_nodes = Vec::new();
-            paragraph_node.collect_descendants("호", &mut subparagraph_nodes);
-            for subparagraph_node in subparagraph_nodes {
-                let mut subparagraph = Subparagraph {
-                    number: subparagraph_node.child_text("호번호"),
-                    branch_number: subparagraph_node.child_text("호가지번호"),
-                    content: subparagraph_node.child_text("호내용"),
-                    items: Vec::new(),
-                };
-
-                let mut item_nodes = Vec::new();
-                subparagraph_node.collect_descendants("목", &mut item_nodes);
-                for item_node in item_nodes {
-                    subparagraph.items.push(Item {
-                        number: item_node.child_text("목번호"),
-                        branch_number: item_node.child_text("목가지번호"),
-                        content: item_node.child_text("목내용"),
-                    });
-                }
-
-                paragraph.subparagraphs.push(subparagraph);
-            }
 
             article.paragraphs.push(paragraph);
         }
@@ -547,6 +565,79 @@ mod tests {
             body.articles[0].paragraphs[0].subparagraphs[0].items.len(),
             1
         );
+    }
+
+    fn items_xml(nested: bool) -> String {
+        let items = r#"
+          <목>
+            <목번호><![CDATA[가.]]></목번호>
+            <목내용><![CDATA[가. 첫째 요건]]></목내용>
+          </목>
+          <목>
+            <목번호><![CDATA[나.]]></목번호>
+            <목내용><![CDATA[나. 둘째 요건]]></목내용>
+          </목>"#;
+        let second = if nested {
+            format!(
+                r#"<호>
+          <호번호><![CDATA[2.]]></호번호>
+          <호내용><![CDATA[2. 다음 각 목의 요건을 갖춘 경우]]></호내용>
+          {items}
+        </호>"#
+            )
+        } else {
+            format!(
+                r#"<호>
+          <호번호><![CDATA[2.]]></호번호>
+          <호내용><![CDATA[2. 다음 각 목의 요건을 갖춘 경우]]></호내용>
+        </호>
+        {items}"#
+            )
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>1</법령ID>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[테스트법]]></법령명_한글>
+  </기본정보>
+  <조문>
+    <조문단위>
+      <조문번호>3</조문번호>
+      <조문제목><![CDATA[적용 대상]]></조문제목>
+      <조문내용><![CDATA[제3조(적용 대상) 본문]]></조문내용>
+      <항>
+        <항번호><![CDATA[①]]></항번호>
+        <항내용><![CDATA[① 다음 각 호의 어느 하나에 해당하는 경우를 말한다.]]></항내용>
+        <호>
+          <호번호><![CDATA[1.]]></호번호>
+          <호내용><![CDATA[1. 첫째 경우]]></호내용>
+        </호>
+        {second}
+      </항>
+    </조문단위>
+  </조문>
+</법령>"#
+        )
+    }
+
+    #[test]
+    fn parses_items_in_both_upstream_layouts() {
+        for nested in [true, false] {
+            let body = parse_law_body(items_xml(nested).as_bytes()).unwrap();
+            let subparagraphs = &body.articles[0].paragraphs[0].subparagraphs;
+
+            assert_eq!(
+                subparagraphs
+                    .iter()
+                    .map(|subparagraph| subparagraph.items.len())
+                    .collect::<Vec<_>>(),
+                vec![0, 2]
+            );
+            assert_eq!(subparagraphs[1].items[0].number, "가.");
+            assert_eq!(subparagraphs[1].items[1].content, "나. 둘째 요건");
+        }
     }
 
     #[test]
