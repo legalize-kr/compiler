@@ -1045,6 +1045,52 @@ mod tests {
         assert!(latest.contains("# 인천광역시 제물포구ㆍ영종구 및 검단구 설치 등에 관한 법률"));
     }
 
+    #[test]
+    fn end_to_end_keeps_same_day_newest_revision_at_head() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join(".cache");
+        let detail_dir = cache_dir.join("detail");
+        fs::create_dir_all(&detail_dir).unwrap();
+        write_jemulpo_xml(
+            &detail_dir,
+            "100",
+            "20240130",
+            "8",
+            "제정",
+            "제1조 (목적) 첫 번째 본문입니다.",
+        );
+        write_jemulpo_xml(
+            &detail_dir,
+            "200",
+            "20240130",
+            "31",
+            "일부개정",
+            "제1조 (목적) 최신 본문입니다.",
+        );
+
+        let output = temp.path().join("output.git");
+        run(Cli {
+            cache_dir,
+            output: output.clone(),
+            validate: false,
+            on_anomaly: OnAnomaly::Warn,
+            strict: false,
+            expect_laws: None,
+            manifest: None,
+        })
+        .unwrap();
+
+        let latest = git_stdout(
+            &output,
+            [
+                "show",
+                "HEAD:kr/인천광역시제물포구ㆍ영종구및검단구설치등에관한법률/법률.md",
+            ],
+        );
+        assert!(latest.contains("법령MST: 200"));
+        assert!(latest.contains("최신 본문입니다."));
+    }
+
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
         let output = Command::new("git")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
