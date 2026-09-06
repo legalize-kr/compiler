@@ -97,8 +97,6 @@ struct HistoryEntry {
 struct PlannedEntry {
     /// Law MST used for file lookup and stable ordering.
     mst: String,
-    /// Original detail XML path used for targeted warning/error messages.
-    source_path: PathBuf,
     /// Final repository path assigned after collision handling.
     path: RepoPathBuf,
     /// Root/Child classification assigned alongside the repository path.
@@ -177,23 +175,13 @@ fn planned_entry_cmp(left: &PlannedEntry, right: &PlannedEntry) -> std::cmp::Ord
             left.metadata
                 .promulgation_number
                 .parse::<u64>()
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "cache 공포번호 must be numeric: {}: {error:?}",
-                        left.source_path.display()
-                    )
-                })
+                .unwrap_or_default()
                 .cmp(
                     &right
                         .metadata
                         .promulgation_number
                         .parse::<u64>()
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "cache 공포번호 must be numeric: {}: {error:?}",
-                                right.source_path.display()
-                            )
-                        }),
+                        .unwrap_or_default(),
                 )
         })
         .then_with(|| {
@@ -336,7 +324,6 @@ fn plan_and_diagnose(cache_dir: &Path) -> Result<(Vec<PlannedEntry>, Diagnostics
 
             Ok(PlanOutcome::Planned(PlannedEntry {
                 mst,
-                source_path: path.clone(),
                 path: RepoPathBuf::root_file(String::new()),
                 kind: EntryKind::Root,
                 metadata,
@@ -1043,6 +1030,100 @@ mod tests {
         assert!(latest.contains("법령MST: 281877"));
         assert!(latest.contains("법령ID: '014604'"));
         assert!(latest.contains("# 인천광역시 제물포구ㆍ영종구 및 검단구 설치 등에 관한 법률"));
+    }
+
+    #[test]
+    fn end_to_end_keeps_same_day_newest_revision_at_head() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join(".cache");
+        let detail_dir = cache_dir.join("detail");
+        fs::create_dir_all(&detail_dir).unwrap();
+        write_jemulpo_xml(
+            &detail_dir,
+            "100",
+            "20240130",
+            "8",
+            "제정",
+            "제1조 (목적) 첫 번째 본문입니다.",
+        );
+        write_jemulpo_xml(
+            &detail_dir,
+            "200",
+            "20240130",
+            "31",
+            "일부개정",
+            "제1조 (목적) 최신 본문입니다.",
+        );
+
+        let output = temp.path().join("output.git");
+        run(Cli {
+            cache_dir,
+            output: output.clone(),
+            validate: false,
+            on_anomaly: OnAnomaly::Warn,
+            strict: false,
+            expect_laws: None,
+            manifest: None,
+        })
+        .unwrap();
+
+        let latest = git_stdout(
+            &output,
+            [
+                "show",
+                "HEAD:kr/인천광역시제물포구ㆍ영종구및검단구설치등에관한법률/법률.md",
+            ],
+        );
+        assert!(latest.contains("법령MST: 200"));
+        assert!(latest.contains("최신 본문입니다."));
+    }
+
+    #[test]
+    fn end_to_end_treats_invalid_promulgation_number_as_zero() {
+        for invalid_number in ["", "미상"] {
+            let temp = TempDir::new().unwrap();
+            let cache_dir = temp.path().join(".cache");
+            let detail_dir = cache_dir.join("detail");
+            fs::create_dir_all(&detail_dir).unwrap();
+            write_jemulpo_xml(
+                &detail_dir,
+                "100",
+                "20240130",
+                invalid_number,
+                "제정",
+                "제1조 (목적) 공포번호 없는 본문입니다.",
+            );
+            write_jemulpo_xml(
+                &detail_dir,
+                "200",
+                "20240130",
+                "31",
+                "일부개정",
+                "제1조 (목적) 최신 본문입니다.",
+            );
+
+            let output = temp.path().join("output.git");
+            run(Cli {
+                cache_dir,
+                output: output.clone(),
+                validate: false,
+                on_anomaly: OnAnomaly::Warn,
+                strict: false,
+                expect_laws: None,
+                manifest: None,
+            })
+            .unwrap();
+
+            let latest = git_stdout(
+                &output,
+                [
+                    "show",
+                    "HEAD:kr/인천광역시제물포구ㆍ영종구및검단구설치등에관한법률/법률.md",
+                ],
+            );
+            assert!(latest.contains("법령MST: 200"));
+            assert!(latest.contains("최신 본문입니다."));
+        }
     }
 
     fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
