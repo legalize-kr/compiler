@@ -148,7 +148,11 @@ impl Admrule {
     }
 
     fn is_repeal(&self) -> bool {
-        self.amendment.contains("폐지")
+        if self.amendment_code.trim().is_empty() {
+            matches!(self.amendment.trim(), "폐지" | "타법폐지")
+        } else {
+            matches!(self.amendment_code.trim(), "200404" | "200410")
+        }
     }
 }
 
@@ -306,7 +310,7 @@ fn write_manifest(path: &Path, manifest: &BuildManifest) -> Result<()> {
     fs::write(path, json).with_context(|| format!("failed to write manifest to {}", path.display()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ImportEntry {
     path: String,
     previous_path: Option<String>,
@@ -386,8 +390,116 @@ fn render_admrule_entries(cache_dir: &Path, limit: Option<usize>) -> Result<Vec<
             .then_with(|| a.path.cmp(&b.path))
     });
     mark_final_state_deletions(&mut entries);
+    if limit.is_none() {
+        append_current_snapshot(cache_dir, &mut entries)?;
+    }
     assign_previous_paths(&mut entries);
     Ok(entries)
+}
+
+#[derive(Deserialize)]
+struct CurrentSnapshot {
+    schema_version: u8,
+    observed_on: String,
+    rules: BTreeMap<String, String>,
+}
+
+/// Preserve publication history, then restore the source-selected current revision.
+fn append_current_snapshot(cache_dir: &Path, entries: &mut Vec<ImportEntry>) -> Result<()> {
+    let snapshot_path = cache_dir.join("current_snapshot.json");
+    if !snapshot_path.exists() {
+        return Ok(());
+    }
+    let snapshot: CurrentSnapshot = serde_json::from_slice(&fs::read(snapshot_path)?)?;
+    ensure!(
+        snapshot.schema_version == 1 && !snapshot.rules.is_empty(),
+        "invalid current admrule snapshot"
+    );
+    ensure!(
+        is_iso_date(&snapshot.observed_on)
+            && !snapshot.observed_on.starts_with("0000")
+            && is_valid_compact_date(&snapshot.observed_on.replace('-', "")),
+        "invalid snapshot date"
+    );
+    let timestamp = commit_timestamp(&snapshot.observed_on)?;
+    let mut current = BTreeMap::new();
+    for entry in entries.iter() {
+        if entry.delete_only || entry.delete_after_write {
+            current.remove(&entry.identity);
+        } else {
+            current.insert(entry.identity.clone(), entry.clone());
+        }
+    }
+    let mut selected: Vec<_> = snapshot.rules.iter().collect();
+    selected.sort_by_key(|(_, serial)| *serial);
+    let mut registry = PathRegistry::new();
+    let mut desired = BTreeMap::new();
+    for (identity, serial) in selected {
+        ensure!(
+            !serial.is_empty() && serial.bytes().all(|c| c.is_ascii_digit()),
+            "invalid snapshot serial"
+        );
+        let active = cache_dir.join(format!("{serial}.xml"));
+        let detail = if active.exists() {
+            active
+        } else {
+            cache_dir.join("retired").join(format!("{serial}.xml"))
+        };
+        let raw = fs::read(detail)
+            .with_context(|| format!("missing current snapshot detail: {identity}/{serial}"))?;
+        let rule = parse_admrule(&raw, serial)?;
+        ensure!(
+            rule.identity() == identity && &rule.serial == serial,
+            "snapshot identity mismatch: {identity}/{serial}"
+        );
+        let path = admrule_path(&rule, &mut registry)
+            .to_string_lossy()
+            .replace('\\', "/");
+        desired.insert(
+            identity.clone(),
+            ImportEntry {
+                path,
+                previous_path: None,
+                identity: identity.clone(),
+                delete_only: false,
+                delete_after_write: false,
+                content: render_markdown(&rule).into_bytes(),
+                message: format!(
+                    "현행 스냅샷: {}\n\n행정규칙일련번호: {}\n행정규칙ID: {}",
+                    rule.name, serial, identity
+                ),
+                deletion_message: None,
+                current_status: rule.current_status.clone(),
+                timestamp,
+                sort_date: compact_date_or_epoch(&snapshot.observed_on),
+                sort_id: serial.parse().unwrap_or(u64::MAX),
+            },
+        );
+    }
+    for (identity, mut entry) in current
+        .iter()
+        .filter(|(id, entry)| {
+            desired
+                .get(*id)
+                .is_none_or(|wanted| wanted.path != entry.path)
+        })
+        .map(|(id, entry)| (id, entry.clone()))
+    {
+        entry.delete_only = true;
+        entry.timestamp = timestamp;
+        entry.message = format!("현행 스냅샷 제외: {identity}\n\n행정규칙ID: {identity}");
+        entries.push(entry);
+    }
+    for (identity, entry) in desired {
+        if current
+            .get(&identity)
+            .is_some_and(|old| old.path == entry.path && old.content == entry.content)
+        {
+            continue;
+        }
+        entries.push(entry);
+    }
+    Ok(())
 }
 
 fn mark_final_state_deletions(entries: &mut [ImportEntry]) {
@@ -525,19 +637,27 @@ fn compile_dir(cache_dir: &Path, output: &Path, limit: Option<usize>) -> Result<
     Ok(())
 }
 
-/// Return sorted XML files from a flat cache directory.
+/// Read archived history and active XML, preferring active data for duplicate serials.
 fn read_xml_files(cache_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(cache_dir)
-        .with_context(|| format!("failed to read {}", cache_dir.display()))?
-    {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("xml") {
-            files.push(path);
+    let mut files = BTreeMap::new();
+    let archive = cache_dir.join("retired");
+    let mut directories = Vec::new();
+    if archive.exists() {
+        directories.push(archive);
+    }
+    directories.push(cache_dir.to_path_buf());
+    for directory in directories {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("xml") {
+                files.insert(entry.file_name(), path);
+            }
         }
     }
-    files.sort();
-    Ok(files)
+    Ok(files.into_values().collect())
 }
 
 /// Parse a cached XML document with a flat tag text map.
@@ -618,32 +738,21 @@ fn ensure_admrule_detail_xml(raw: &[u8]) -> Result<()> {
 
 /// Extract all text values by tag name.
 fn tag_texts(raw: &[u8]) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut reader = Reader::from_reader(raw);
-    reader.config_mut().trim_text(true);
-    let mut current = String::new();
-    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    loop {
-        match reader.read_event()? {
-            Event::Start(event) => {
-                current = String::from_utf8_lossy(event.name().as_ref()).to_string()
-            }
-            Event::Text(text) if !current.is_empty() => {
-                let value = text.decode()?.trim().to_string();
-                if !value.is_empty() {
-                    fields.entry(current.clone()).or_default().push(value);
-                }
-            }
-            Event::CData(text) if !current.is_empty() => {
-                let value = text.decode()?.trim().to_string();
-                if !value.is_empty() {
-                    fields.entry(current.clone()).or_default().push(value);
-                }
-            }
-            Event::End(_) => current.clear(),
-            Event::Eof => break,
-            _ => {}
+    fn collect(node: &XmlNode, fields: &mut BTreeMap<String, Vec<String>>) {
+        let value = node.text.trim();
+        if !value.is_empty() {
+            fields
+                .entry(node.name.clone())
+                .or_default()
+                .push(value.to_string());
+        }
+        for child in &node.children {
+            collect(child, fields);
         }
     }
+    let root = parse_xml_tree(raw)?;
+    let mut fields = BTreeMap::new();
+    collect(&root, &mut fields);
     Ok(fields)
 }
 
@@ -679,7 +788,6 @@ fn collect_attachments(raw: &[u8]) -> Result<Vec<Attachment>> {
 
 fn parse_xml_tree(raw: &[u8]) -> Result<XmlNode> {
     let mut reader = Reader::from_reader(raw);
-    reader.config_mut().trim_text(true);
     let mut stack: Vec<XmlNode> = Vec::new();
     let mut root = None;
 
@@ -699,13 +807,37 @@ fn parse_xml_tree(raw: &[u8]) -> Result<XmlNode> {
                 }
             }
             Event::Text(text) => {
-                if let Some(node) = stack.last_mut() {
-                    node.text.push_str(&text.decode()?);
+                if let Some(node) = stack.last_mut()
+                    && node.children.is_empty()
+                {
+                    node.text.push_str(&text.xml10_content()?);
                 }
             }
             Event::CData(text) => {
-                if let Some(node) = stack.last_mut() {
-                    node.text.push_str(&text.decode()?);
+                if let Some(node) = stack.last_mut()
+                    && node.children.is_empty()
+                {
+                    node.text.push_str(&text.xml10_content()?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                let value = if let Some(character) = reference.resolve_char_ref()? {
+                    character.to_string()
+                } else {
+                    match reference.decode()?.as_ref() {
+                        "amp" => "&",
+                        "lt" => "<",
+                        "gt" => ">",
+                        "apos" => "'",
+                        "quot" => "\"",
+                        name => anyhow::bail!("unknown XML entity: {name}"),
+                    }
+                    .to_string()
+                };
+                if let Some(node) = stack.last_mut()
+                    && node.children.is_empty()
+                {
+                    node.text.push_str(&value);
                 }
             }
             Event::End(_) => {
@@ -776,9 +908,7 @@ fn attachment_from_node(node: &XmlNode, index: usize) -> Option<Attachment> {
             .filter(|value| !value.is_empty())
             .unwrap_or("별표")
             .to_string(),
-        title: first_attachment(node, &["별표제목", "별표명"])
-            .unwrap_or("")
-            .to_string(),
+        title: nfc(first_attachment(node, &["별표제목", "별표명"]).unwrap_or("")),
         file_link,
         pdf_link,
     })
@@ -1366,14 +1496,12 @@ fn is_circled_number(ch: char) -> bool {
 }
 
 fn is_numeric_marker(marker: &str) -> bool {
-    if let Some((head, tail)) = marker.split_once("의") {
-        !head.is_empty()
-            && head.chars().all(|ch| ch.is_ascii_digit())
-            && !tail.is_empty()
-            && tail.chars().all(|ch| ch.is_ascii_digit())
-    } else {
-        !marker.is_empty() && marker.chars().all(|ch| ch.is_ascii_digit())
-    }
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| {
+            regex::Regex::new(r"^\d+(?:의\d+)?$").expect("valid numeric marker pattern")
+        })
+        .is_match(marker)
 }
 
 fn is_korean_item_marker(marker: &str) -> bool {
@@ -1391,12 +1519,12 @@ fn is_korean_item_marker(marker: &str) -> bool {
     let Some(tail) = rest.strip_prefix("의") else {
         return false;
     };
-    !tail.is_empty() && tail.chars().all(|ch| ch.is_ascii_digit())
+    !tail.is_empty() && tail.chars().all(is_decimal_digit)
 }
 
 fn structure_level(line: &str) -> Option<&'static str> {
     let rest = line.strip_prefix('제')?;
-    let (_, mut rest) = take_ascii_digits(rest)?;
+    let (_, mut rest) = take_digits(rest)?;
     if let Some((_, after_branch)) = take_branch(rest) {
         rest = after_branch;
     }
@@ -1429,7 +1557,7 @@ struct ParsedArticle<'a> {
 
 fn parse_article_with_title(line: &str) -> Option<ParsedArticle<'_>> {
     let rest = line.strip_prefix('제')?;
-    let (number, rest) = take_ascii_digits(rest)?;
+    let (number, rest) = take_digits(rest)?;
     let rest = rest.strip_prefix('조')?;
     let (branch, rest) = take_optional_branch(rest);
     let rest = rest.trim_start().strip_prefix('(')?;
@@ -1444,7 +1572,7 @@ fn parse_article_with_title(line: &str) -> Option<ParsedArticle<'_>> {
 
 fn parse_deleted_article(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix('제')?;
-    let (number, rest) = take_ascii_digits(rest)?;
+    let (number, rest) = take_digits(rest)?;
     let rest = rest.strip_prefix('조')?;
     let (branch, rest) = take_optional_branch(rest);
     if rest.trim() == "삭제" {
@@ -1460,15 +1588,25 @@ fn take_optional_branch(value: &str) -> (&str, &str) {
 
 fn take_branch(value: &str) -> Option<(&str, &str)> {
     let after_marker = value.strip_prefix("의")?;
-    let (digits, rest) = take_ascii_digits(after_marker)?;
+    let (digits, rest) = take_digits(after_marker)?;
     let end = "의".len() + digits.len();
     Some((&value[..end], rest))
 }
 
-fn take_ascii_digits(value: &str) -> Option<(&str, &str)> {
+fn is_decimal_digit(character: char) -> bool {
+    if character.is_ascii_digit() {
+        return true;
+    }
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| regex::Regex::new(r"^\d$").expect("valid decimal digit pattern"))
+        .is_match(character.encode_utf8(&mut [0; 4]))
+}
+
+fn take_digits(value: &str) -> Option<(&str, &str)> {
     let end = value
         .char_indices()
-        .find_map(|(idx, ch)| (!ch.is_ascii_digit()).then_some(idx))
+        .find_map(|(idx, ch)| (!is_decimal_digit(ch)).then_some(idx))
         .unwrap_or(value.len());
     if end == 0 {
         None
@@ -1518,12 +1656,16 @@ fn render_markdown(rule: &Admrule) -> String {
         yaml_string(&rule.rule_type),
         yaml_string(&rule.top_ministry),
         yaml_string(&rule.ministry),
-        original_ministry,
         org_path,
+        original_ministry,
         quoted_or_null(&rule.org_code),
         yaml_string(&rule.issue_no),
         issue_date,
-        format_date(&rule.effective_date_raw),
+        if is_valid_compact_date(&rule.effective_date_raw.replace(['.', '-'], "")) {
+            format_date(&rule.effective_date_raw)
+        } else {
+            yaml_string(&rule.effective_date_raw)
+        },
         yaml_string(&rule.amendment),
         yaml_string(&rule.amendment_code),
         yaml_string(&rule.current_history),
@@ -1549,7 +1691,41 @@ fn quoted_or_null(value: &str) -> String {
 }
 
 fn yaml_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    if !value.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{fffe}' | '\u{ffff}'
+            )
+    }) {
+        return format!("'{}'", value.replace('\'', "''"));
+    }
+    let mut quoted = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '\0' => quoted.push_str("\\0"),
+            '\u{7}' => quoted.push_str("\\a"),
+            '\u{8}' => quoted.push_str("\\b"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\u{b}' => quoted.push_str("\\v"),
+            '\u{c}' => quoted.push_str("\\f"),
+            '\r' => quoted.push_str("\\r"),
+            '\u{1b}' => quoted.push_str("\\e"),
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{85}' => quoted.push_str("\\N"),
+            '\u{2028}' => quoted.push_str("\\L"),
+            '\u{2029}' => quoted.push_str("\\P"),
+            '\u{feff}' | '\u{fffe}' | '\u{ffff}' => {
+                quoted.push_str(&format!("\\u{:04X}", c as u32))
+            }
+            c if c.is_control() => quoted.push_str(&format!("\\x{:02X}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]

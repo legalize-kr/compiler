@@ -10,6 +10,7 @@ dependencies = [
  "clap",
  "git-writer",
  "quick-xml",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

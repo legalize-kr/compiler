@@ -54,8 +54,22 @@ admrule-kr-compiler ../.cache/admrule --tree -o ./admrule-tree
    - `출력 경로 asc`
 6. 정렬된 순서대로 Markdown과 commit message를 만들고 commit을 작성합니다.
    같은 identity의 개정으로 경로가 바뀌면 이전 경로의 파일을 함께 삭제합니다.
-   `제개정구분`에 `폐지`가 포함된 revision은 새 Markdown을 쓰지 않고 해당
-   identity의 최신 경로를 삭제합니다.
+   폐지 코드 `200404`, `200410`은 해당 identity의 최신 경로를 삭제합니다.
+   `폐지제정`(`200407`)은 새 본문을 남깁니다.
+7. 전체 빌드에서 `current_snapshot.json`이 있으면 원천 API가 현행으로 선택한
+   판본을 최종 HEAD에 복원합니다. 시행 예정판도 발령일순 이력에 보존합니다.
+   복원 또는 제외 커밋은 목록 관측일을 사용합니다.
+   필요한 상세 XML이 없거나 ID가 맞지 않으면 빌드를 중단합니다.
+
+`current_snapshot.json`은 `admrules.fetch_cache`가 만드는 캐시 계약입니다.
+`schema_version: 1`, 관측일 `observed_on`, ID별 일련번호 `rules`를 포함합니다.
+목록에는 없지만 상세 API가 현행으로 확인한 자료는 `supplemental`에 근거를 남기고 보존합니다.
+목록에서 사라진 과거 XML은 `retired/`에 보관하며 컴파일 대상에 포함합니다.
+동일 일련번호가 두 위치에 있으면 활성 캐시를 우선합니다.
+YAML 문자열은 길이 때문에 줄을 나누지 않습니다. 줄바꿈과 제어 문자는
+큰따옴표 문자열 안에서 이스케이프하며, Python과 같은 값과 바이트를 보존합니다.
+이 파일이 없는 옛 캐시는 기존 상태 판정을 사용하므로, 전체 재생성 전에
+파이프라인으로 캐시를 갱신해야 합니다. `--limit` 표본 빌드는 전체 현행 선택을 적용하지 않습니다.
 
 ## 출력 특성
 
