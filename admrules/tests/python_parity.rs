@@ -529,3 +529,101 @@ fn attachment_only_source_preserves_links_and_satisfies_body_requirement() {
     assert!(actual.contains("<http://law.go.kr/flDownload.do?flSeq=1>"));
     assert!(actual.contains("<https://www.law.go.kr/LSW/flDownload.do?flSeq=2>"));
 }
+
+#[test]
+fn duplicate_current_source_preserves_history_and_matches_python() {
+    let pipeline = pipeline_dir().expect("Python pipeline required for snapshot parity");
+    let source = pipeline.join("tests/fixtures/admrule_duplicate_current_2088530");
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_stem().unwrap().to_string_lossy();
+        if name.bytes().all(|ch| ch.is_ascii_digit()) {
+            fs::copy(&path, cache.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let python_out = temp.path().join("python");
+    let script = r#"
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from admrules import api_client, snapshot
+from admrules.import_admrules import import_from_cache
+source, output = map(Path, sys.argv[1:])
+def request(url, params):
+    name = 'search.xml' if url.endswith('/lawSearch.do') else params['ID'] + '.xml'
+    return SimpleNamespace(content=(source / name).read_bytes())
+api_client._request = request
+rows = api_client.search_admrules()['admrules']
+selection = snapshot.write_current_snapshot(rows, history_entries=rows)
+assert selection['rules'] == {'2088530': '2100000286966'}
+assert import_from_cache(output)['errors'] == 0
+snapshot.reconcile_current_snapshot(output)
+"#;
+    let python = Command::new(std::env::var("PYTHON").unwrap_or_else(|_| "python".into()))
+        .args(["-c", script])
+        .arg(&source)
+        .arg(&python_out)
+        .env("PYTHONPATH", &pipeline)
+        .env("LEGALIZE_ADMRULE_CACHE_DIR", &cache)
+        .output()
+        .unwrap();
+    assert!(
+        python.status.success(),
+        "{}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    let bare = temp.path().join("output.git");
+    let clone = temp.path().join("clone");
+    let rust = Command::new(env!("CARGO_BIN_EXE_admrule-kr-compiler"))
+        .arg(&cache)
+        .arg("-o")
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(
+        rust.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rust.stderr)
+    );
+    assert!(
+        Command::new("git")
+            .arg("clone")
+            .arg(&bare)
+            .arg(&clone)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["-c", "core.quotePath=false", "ls-files"])
+        .output()
+        .unwrap();
+    let files = String::from_utf8(files.stdout).unwrap();
+    let bodies: Vec<_> = files.lines().filter(|p| p.ends_with("/본문.md")).collect();
+    assert_eq!(bodies.len(), 1);
+    for path in bodies {
+        let actual = fs::read_to_string(clone.join(path)).unwrap();
+        assert_eq!(actual, fs::read_to_string(python_out.join(path)).unwrap());
+        assert!(actual.contains("2100000286966"));
+    }
+    let history = Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args(["log", "--format=%B"])
+        .output()
+        .unwrap();
+    let history = String::from_utf8(history.stdout).unwrap();
+    for entry in fs::read_dir(&cache).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "xml") {
+            let serial = path.file_stem().unwrap().to_string_lossy();
+            assert!(history.contains(&format!("행정규칙일련번호: {serial}")));
+        }
+    }
+}
